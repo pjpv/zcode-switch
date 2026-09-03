@@ -1,0 +1,27 @@
+[1m[92m    Updating[0m crates.io index
+[1m[92m   Compiling[0m zcode-switch v1.5.0 (/home/runner/work/zcode-switch/zcode-switch/src-tauri)
+[1m[91merror[E0308][0m[1m: mismatched types[0m
+   [1m[94m--> [0msrc/store.rs:361:22
+    [1m[94m|[0m
+[1m[94m361[0m [1m[94m|[0m     let _ = detached(cmd).spawn();
+    [1m[94m|[0m             [1m[94m--------[0m [1m[91m^^^[0m [1m[91mexpected `Command`, found `&mut Command`[0m
+    [1m[94m|[0m             [1m[94m|[0m
+    [1m[94m|[0m             [1m[94marguments to this function are incorrect[0m
+    [1m[94m|[0m
+[1m[92mnote[0m: function defined here
+   [1m[94m--> [0msrc/store.rs:34:4
+    [1m[94m|[0m
+[1m[94m 34[0m [1m[94m|[0m fn detached(mut c: std::process::Command) -> std::process::Command {
+    [1m[94m|[0m    [1m[92m^^^^^^^^[0m [1m[94m----------------------------[0m
+
+[1m[33mwarning[0m[1m: unused variable: `b`[0m
+    [1m[94m--> [0msrc/store.rs:1829:13
+     [1m[94m|[0m
+[1m[94m1829[0m [1m[94m|[0m         let b = capture_current(&p, Some("B".into())).unwrap();
+     [1m[94m|[0m             [1m[33m^[0m [1m[33mhelp: if this is intentional, prefix it with an underscore: `_b`[0m
+     [1m[94m|[0m
+     [1m[94m= [0m[1mnote[0m: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+[1mFor more information about this error, try `rustc --explain E0308`.[0m
+[1m[33mwarning[0m: `zcode-switch` (lib test) generated 1 warning
+[1m[91merror[0m: could not compile `zcode-switch` (lib test) due to 1 previous error; 1 warning emitted
