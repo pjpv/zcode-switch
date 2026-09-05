@@ -206,7 +206,7 @@ export function openProviderModal(m) {
         ${(m.providers || []).map((p) => `
           <button class="pv-item" data-id="${esc(p.id)}">
             <span class="pv-name">${esc(displayOf(p))}</span>
-            <span class="pv-arrow">→</span>
+            <span class="pv-arrow">${ic("chev", 14)}</span>
           </button>`).join("")}
       </div>
       <div class="pv-actions"><button class="btn-ghost pv-cancel">${t("common.cancel")}</button></div>

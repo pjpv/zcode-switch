@@ -5,19 +5,14 @@ import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
 
 const $app = document.getElementById("app");
+const isMac = /Macintosh|MacIntel/.test(navigator.userAgent);
+if (isMac) document.body.classList.add("mac");
 let state = null;
 let renaming = null;
 let busy = false;
 let acctQuota = {};
 let claimable = {};
 let claimAllRunning = false;
-
-const NOTCH_COLORS = ["var(--notch-1)", "var(--notch-2)", "var(--notch-3)", "var(--notch-4)", "var(--notch-5)", "var(--notch-6)"];
-function notchColor(id) {
-  let h = 0;
-  for (const c of id) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-  return NOTCH_COLORS[h % NOTCH_COLORS.length];
-}
 
 function fmtNum(v) {
   if (v == null) return t("q.unknown");
@@ -309,13 +304,12 @@ const actions = {
   },
 };
 
-function quotaBarHtml(pct) {
+function quotaMeterHtml(pct) {
   const used = pct == null ? null : Math.min(100, Math.max(0, pct));
-  const remaining = used == null ? null : 100 - used;
-  const danger = used != null && used >= 90 ? " danger" : used != null && used >= 70 ? " warn" : "";
-  const txt = remaining == null ? "--" : remaining.toFixed(0) + "%";
-  const txtCls = (remaining ?? 100) >= 58 ? " in-fill" : "";
-  return `<div class="qbar${danger}"><div class="qbar-fill" style="width:${remaining ?? 100}%"></div><span class="qbar-pct${txtCls}">${txt}</span></div>`;
+  const cls = used != null && used >= 90 ? " danger" : used != null && used >= 70 ? " warn" : "";
+  const rem = used == null ? null : 100 - used;
+  const txt = rem == null ? "--" : rem.toFixed(0) + "%";
+  return `<div class="q-meter${cls}"><span class="q-meter-pct">${txt}</span><div class="qbar"><div class="qbar-fill" style="width:${rem == null ? 0 : rem}%"></div></div></div>`;
 }
 
 function itemKind(it) {
@@ -343,8 +337,8 @@ function resetLabel(it) {
 function winRowHtml(it, cls = "") {
   return `
   <div class="q-win${cls}">
-    <span class="q-win-label">${esc(windowLabel(it))}</span>
-    ${quotaBarHtml(it.percent_used)}
+    <span class="q-win-label" title="${esc(windowLabel(it))}">${esc(windowLabel(it))}</span>
+    ${quotaMeterHtml(it.percent_used)}
     <span class="q-win-reset" title="${esc(resetLabel(it))}">${it.reset || it.period_end ? esc(resetLabel(it)) : ""}</span>
   </div>`;
 }
@@ -368,7 +362,7 @@ function balRowHtml(it) {
   return `
   <div class="q-win mini">
     <span class="q-win-label" title="${esc(it.name)}">${esc(label)}</span>
-    ${quotaBarHtml(it.percent_used)}
+    ${quotaMeterHtml(it.percent_used)}
     <span class="q-win-reset">${esc(rem)}</span>
   </div>`;
 }
@@ -415,10 +409,9 @@ function claimStripHtml(id) {
   const label = plan.name || plan.plan_id;
   return `
   <div class="claim-strip" title="${esc(plan.description || label)}">
-    ${ic("gift", 15)}
     <span class="claim-name">${esc(label)}</span>
     ${grants ? `<span class="claim-grants">${esc(grants)}</span>` : ""}
-    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>
+    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning ? "disabled" : ""}>${t("btn.claim")}</button>
   </div>`;
 }
 
@@ -517,7 +510,7 @@ function restoreScroll(cap) {
 function render() {
   const scrollCap = captureScroll();
   if (!state) {
-    $app.innerHTML = `<div class="loading">LOADING</div>`;
+    $app.innerHTML = `<div class="loading">${t("q.loading")}</div>`;
     return;
   }
   const s = state;
@@ -535,43 +528,44 @@ function render() {
     const isActive = a.is_active;
     if (renaming === a.id) {      return `
       <div class="row${isActive ? " active" : ""}" data-id="${a.id}">
-        <span class="notch" style="background:${notchColor(a.id)}"></span>
-        <div class="row-main">
-          <input class="rename-input" value="${esc(a.name)}" maxlength="40"
-            keydown="onRenameKey(event,'${a.id}')" blur="actions.deferCancelRename('${a.id}')">
-          <div class="row-meta">${t("btn.renameMeta")}</div>
-        </div>
-        <div class="row-actions">
-          <button class="btn-ghost" style="padding:4px 10px" click="actions.doRename('${a.id}')">${t("common.save")}</button>
-          <button class="btn-ghost" style="padding:4px 10px" click="actions.cancelRename()">${t("common.cancel")}</button>
+        <div class="row-top">
+          <div class="row-main">
+            <input class="rename-input" value="${esc(a.name)}" maxlength="40"
+              keydown="onRenameKey(event,'${a.id}')" blur="actions.deferCancelRename('${a.id}')">
+            <div class="row-meta">${t("btn.renameMeta")}</div>
+          </div>
+          <div class="row-actions">
+            <button class="btn-ghost" style="padding:4px 10px" click="actions.doRename('${a.id}')">${t("common.save")}</button>
+            <button class="btn-ghost" style="padding:4px 10px" click="actions.cancelRename()">${t("common.cancel")}</button>
+          </div>
         </div>
       </div>`;
     }
     const ident = [a.identity?.username, a.identity?.email].filter(Boolean).join(" · ");
     const q = acctQuota[a.id];
-    let meta = "";
-    if (!a.has_config) meta += `<span class="no-cfg">${t("q.noCfg")}</span>`;
+    const metaParts = [];
+    if (!a.has_config) metaParts.push(`<span class="no-cfg">${t("q.noCfg")}</span>`);
     const exp = expireInfo(q?.data?.plan_expire);
     if (exp) {
-        meta += `<span class="${exp.warn ? "warn-line" : ""}">${esc(t("q.validUntil", { date: exp.text }))}</span>`;
+        metaParts.push(`<span class="${exp.warn ? "warn-line" : ""}" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntil", { date: exp.text }))}</span>`);
     }
-    if (ident) meta += `${meta ? " · " : ""}${esc(ident)}`;
+    if (ident) metaParts.push(`<span>${esc(ident)}</span>`);
+    const meta = metaParts.join('<span class="meta-dot">·</span>');
     return `
     <div class="row${isActive ? " active" : ""}" data-id="${a.id}">
       <div class="row-top">
-        <span class="notch" style="background:${notchColor(a.id)}"></span>
         <div class="row-main">
-          <div class="row-name">${esc(a.name)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}</div>
+          <div class="row-name">${esc(a.name)}${tierBadgeFor(a.id)}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <div class="row-actions">
-          <button class="icon-btn" title="${t("btn.quota")}" aria-label="${t("btn.quota")}" click="actions.acctQuota('${a.id}')">${ic("gauge", 16)}</button>
-          <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 16)}</button>
-          <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 16)}</button>
-          <button class="icon-btn danger" title="${t("btn.delete")}" aria-label="${t("btn.delete")}" click="actions.delete('${a.id}')">${ic("x", 16)}</button>
-          <button class="btn-switch has-ic" click="actions.askSwitch('${a.id}')" ${isActive ? "disabled" : ""}>
-            ${isActive ? t("btn.current") : ic("swap", 14) + " " + t("btn.switch")}
-          </button>
+          <button class="icon-btn" title="${t("btn.quota")}" aria-label="${t("btn.quota")}" click="actions.acctQuota('${a.id}')">${ic("gauge", 15)}</button>
+          <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 15)}</button>
+          <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 15)}</button>
+          <button class="icon-btn danger" title="${t("btn.delete")}" aria-label="${t("btn.delete")}" click="actions.delete('${a.id}')">${ic("x", 15)}</button>
+          ${isActive
+            ? `<button class="btn-switch" disabled>${t("btn.selected")}</button>`
+            : `<button class="btn-switch" click="actions.askSwitch('${a.id}')">${t("btn.switch")}</button>`}
         </div>
       </div>
       ${acctQuotaSlot(a.id)}
@@ -580,7 +574,6 @@ function render() {
 
   const listHtml = s.accounts.length === 0
     ? `<div class="empty">
-         <div class="glyph">${ic("empty", 34)}</div>
          ${t("m.emptyTitle")}<br>
          ${t("m.emptyBody")}
        </div>`
@@ -588,36 +581,34 @@ function render() {
 
   const claimableCount = s.accounts.filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
 
+  const countText = s.accounts.length === 1
+    ? t("m.signedInOne", { count: s.accounts.length })
+    : t("m.signedInOther", { count: s.accounts.length });
   $app.innerHTML = `
-    <header class="topbar">
-      <div class="wordmark">Z·SWITCH</div>
-      <div class="top-status${unsaved ? " unsaved" : ""}">
-        <span class="status-dot ${dotCls}"></span>
+    <header class="topbar" data-tauri-drag-region>
+      <div class="top-status${unsaved ? " unsaved" : ""}${dotCls === "off" ? " off" : ""}">
+        ${ic("bot", 15)}
         <span class="status-text">${esc(statusText)}</span>
       </div>
+      <span class="acct-count">${esc(countText)}</span>
     </header>
 
     <section class="toolbar">
       <button class="btn-primary has-ic${unsaved ? " attention" : ""}" click="actions.capture()" ${!s.live_logged_in || active ? "disabled" : ""}
         title="${active ? esc(t("m.saveLoginDisabledTitle", { name: active.name })) : ""}">
-        ${ic("capture", 16)} ${t("btn.saveLogin")}
+        ${t("btn.saveLogin")}
       </button>
       ${claimableCount > 0
         ? `<button class="btn-ghost has-ic claim-all" click="actions.claimAll()" ${claimAllRunning ? "disabled" : ""}
-            title="${t("btn.claimAllTitle")}">${ic("gift", 16)} ${t("btn.claimAll")}${claimableCount > 1 ? ` (${claimableCount})` : ""}</button>`
+            title="${t("btn.claimAllTitle")}">${t("btn.claimAll")}${claimableCount > 1 ? ` (${claimableCount})` : ""}</button>`
         : ""}
-      <button class="btn-ghost has-ic" click="actions.addAccount()" title="${t("btn.addAccountTitle")}">${ic("userPlus", 16)} ${t("btn.addAccount")}</button>
+      <button class="btn-ghost has-ic" click="actions.addAccount()" title="${t("btn.addAccountTitle")}">${t("btn.addAccount")}</button>
       ${s.zcode_running
-        ? `<button class="btn-ghost has-ic" click="actions.askKill()" title="${t("btn.killZcode")}">${ic("power", 16)} ${t("btn.killZcode")}</button>`
-        : `<button class="btn-ghost has-ic" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"}>${ic("play", 14)} ${t("btn.launchZcode")}</button>`}
+        ? `<button class="btn-ghost has-ic" click="actions.askKill()" title="${t("btn.killZcode")}">${t("btn.killZcode")}</button>`
+        : `<button class="btn-ghost has-ic" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"}>${t("btn.launchZcode")}</button>`}
       <span class="tb-spacer"></span>
       <button class="btn-ghost tb-gear has-ic" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 16)}</button>
     </section>
-
-    <div class="section-head">
-      <h2>${t("m.accounts")}</h2>
-      <span class="count">${t("m.count", { count: s.accounts.length })}</span>
-    </div>
 
     <main class="list">${listHtml}</main>
   `;

@@ -49,6 +49,7 @@ CLI password (export / import): prefer the `ZSW_PASSWORD` environment variable (
 ```bash
 npm install
 npm run tauri dev      # development (HMR)
+`npm run dev          # frontend-only preview (open preview.html / preview-settings.html in a browser, mocked data, no Tauri needed)`
 npm run tauri build    # NSIS installer
 cd src-tauri && cargo test   # unit tests (incl. node↔Rust cross-language crypto vectors)
 ```
