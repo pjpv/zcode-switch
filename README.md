@@ -49,6 +49,7 @@ CLI 密码（export / import）：优先环境变量 `ZSW_PASSWORD`（不出现�
 ```bash
 npm install
 npm run tauri dev      # 开发（HMR）
+`npm run dev          # 仅前端预览（浏览器打开 preview.html / preview-settings.html，内置 mock 数据，无需 Tauri）`
 npm run tauri build    # NSIS 安装包
 cd src-tauri && cargo test   # 单元测试（含 node↔Rust 跨语言加密向量）
 ```

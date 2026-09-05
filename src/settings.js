@@ -160,39 +160,44 @@ const langSeg = (cur) => `
 
 function render() {
   if (!state) {
-    $app.innerHTML = `<div class="loading">LOADING</div>`;
+    $app.innerHTML = `<div class="loading">${t("q.loading")}</div>`;
     return;
   }
   const s = state;
   document.title = `Z·SWITCH ${t("s.title")}`;
   $app.innerHTML = `
-    <header class="topbar">
-      <div class="wordmark">Z·SWITCH <span class="ver">/ ${t("s.title")}</span></div>
-    </header>
     <section class="settings open">
-      ${langSeg(s.language || "zh")}
-      <label>BEHAVIOR · ${t("s.behaviorLabel")}</label>
-      ${toggle(autostart, "actions.toggleAutostart()", t("s.autostart"), t("s.autostartDesc"))}
-      ${toggle(s.launch_after_switch, "actions.toggleBehavior('launch')", t("s.launchAfter"), t("s.launchAfterDesc"))}
-      ${toggle(s.close_to_tray, "actions.toggleBehavior('tray')", t("s.closeTray"), t("s.closeTrayDesc"))}
-      ${toggle(s.hot_switch, "actions.toggleBehavior('hot')", t("s.hotSwitch"), t("s.hotSwitchDesc"))}
-      <label style="margin-top:14px">${t("s.authLabel")}</label>
-      ${toggle(s.auth_proxy_on, "actions.toggleAuthProxy()", t("s.proxyToggle"), t("s.proxyToggleDesc"))}
-      <div class="path-line" style="margin-top:6px">
-        <input class="zcode-path auth-proxy" type="text" value="${esc(s.auth_proxy_url || "")}"
-          placeholder="${t("s.proxyPh")}" keydown="onProxyKey(event)">
-        <button class="btn-ghost" click="actions.saveProxy()">${t("common.save")}</button>
+      <div class="set-group">${langSeg(s.language || "zh")}</div>
+      <div class="set-label">${t("s.behaviorLabel")}</div>
+      <div class="set-group">
+        ${toggle(autostart, "actions.toggleAutostart()", t("s.autostart"), t("s.autostartDesc"))}
+        ${toggle(s.launch_after_switch, "actions.toggleBehavior('launch')", t("s.launchAfter"), t("s.launchAfterDesc"))}
+        ${toggle(s.close_to_tray, "actions.toggleBehavior('tray')", t("s.closeTray"), t("s.closeTrayDesc"))}
+        ${toggle(s.hot_switch, "actions.toggleBehavior('hot')", t("s.hotSwitch"), t("s.hotSwitchDesc"))}
       </div>
-      <label style="margin-top:14px">${t("s.libLabel")}</label>
-      <div class="lib-row">
-        <button class="btn-ghost has-ic" click="actions.importFiles()">${ic("import", 14)} ${t("s.importBtn")}</button>
-        <button class="btn-ghost has-ic" click="actions.exportAll()" ${s.accounts.length ? "" : "disabled"}>${ic("exportAll", 14)} ${t("s.exportAllBtn")}</button>
+      <div class="set-label">${t("s.authLabel")}</div>
+      <div class="set-group">
+        ${toggle(s.auth_proxy_on, "actions.toggleAuthProxy()", t("s.proxyToggle"), t("s.proxyToggleDesc"))}
+        <div class="path-line">
+          <input class="zcode-path auth-proxy" type="text" value="${esc(s.auth_proxy_url || "")}"
+            placeholder="${t("s.proxyPh")}" keydown="onProxyKey(event)">
+          <button class="btn-ghost" click="actions.saveProxy()">${t("common.save")}</button>
+        </div>
       </div>
-      <label style="margin-top:14px">${t("s.pathLabel")}</label>
-      <div class="path-line">
-        <input class="zcode-path" type="text" value="${esc(s.zcode_path)}" placeholder="C:\\Program Files\\ZCode\\ZCode.exe" keydown="onPathKey(event)">
-        <button class="btn-ghost" click="actions.browsePath()">${t("s.browse")}</button>
-        <button class="btn-ghost" click="actions.savePath()">${t("common.save")}</button>
+      <div class="set-label">${t("s.libLabel")}</div>
+      <div class="set-group">
+        <div class="lib-row">
+          <button class="btn-ghost has-ic" click="actions.importFiles()">${t("s.importBtn")}</button>
+          <button class="btn-ghost has-ic" click="actions.exportAll()" ${s.accounts.length ? "" : "disabled"}>${t("s.exportAllBtn")}</button>
+        </div>
+      </div>
+      <div class="set-label">${t("s.pathLabel")}</div>
+      <div class="set-group">
+        <div class="path-line">
+          <input class="zcode-path" type="text" value="${esc(s.zcode_path)}" placeholder="C:\\Program Files\\ZCode\\ZCode.exe" keydown="onPathKey(event)">
+          <button class="btn-ghost" click="actions.browsePath()">${t("s.browse")}</button>
+          <button class="btn-ghost" click="actions.savePath()">${t("common.save")}</button>
+        </div>
       </div>
       <div class="hint">${t("s.hint")}</div>
       <div class="gh-row"><a class="gh-link" href="https://github.com/pjpv/zcode-switch" target="_blank" rel="noopener" click="actions.openGitHub()">${t("s.githubLink")}</a></div>
