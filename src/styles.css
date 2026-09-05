@@ -126,6 +126,15 @@ input:focus-visible { outline: none; }
   border-bottom: 1px solid var(--line-soft);
   flex: none;
 }
+body.mac .topbar {
+  padding: 9px 20px 10px 84px; /* 左侧避让 macOS 红绿灯,与系统标题栏同一行 */
+}
+.tb-drag { display: none; }
+body.mac .tb-drag {
+  display: block;
+  height: 26px;
+  flex: none;
+}
 .acct-count {
   font-size: 12px;
   color: var(--fg-3);

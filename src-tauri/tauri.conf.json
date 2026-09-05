@@ -21,6 +21,8 @@
         "center": true,
         "theme": "Dark",
         "backgroundColor": "#101012",
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
         "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server"
       }
     ],

@@ -5,6 +5,8 @@ import { ic } from "./icons.js";
 import { init, t, lang, stripErr } from "./i18n.js";
 
 const $app = document.getElementById("app");
+const isMac = /Macintosh|MacIntel/.test(navigator.userAgent);
+if (isMac) document.body.classList.add("mac");
 let state = null;
 let autostart = false;
 let busy = false;
@@ -166,6 +168,7 @@ function render() {
   const s = state;
   document.title = `Z·SWITCH ${t("s.title")}`;
   $app.innerHTML = `
+    <div class="tb-drag" data-tauri-drag-region></div>
     <section class="settings open">
       <div class="set-group">${langSeg(s.language || "zh")}</div>
       <div class="set-label">${t("s.behaviorLabel")}</div>

@@ -5,6 +5,8 @@ import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
 
 const $app = document.getElementById("app");
+const isMac = /Macintosh|MacIntel/.test(navigator.userAgent);
+if (isMac) document.body.classList.add("mac");
 let state = null;
 let renaming = null;
 let busy = false;
@@ -583,7 +585,7 @@ function render() {
     ? t("m.signedInOne", { count: s.accounts.length })
     : t("m.signedInOther", { count: s.accounts.length });
   $app.innerHTML = `
-    <header class="topbar">
+    <header class="topbar" data-tauri-drag-region>
       <div class="top-status${unsaved ? " unsaved" : ""}${dotCls === "off" ? " off" : ""}">
         ${ic("bot", 15)}
         <span class="status-text">${esc(statusText)}</span>
