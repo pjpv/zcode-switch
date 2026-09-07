@@ -44,6 +44,13 @@ zcode-switch.exe --cli --lang en state              # English output (--lang tak
 
 CLI password (export / import): prefer the `ZSW_PASSWORD` environment variable (keeps it out of process lists and command history); `--password <password>` also works.
 
+## FAQ
+
+### macOS asks for Microphone / Accessibility / Screen Recording permission?
+
+Deny all of them — nothing breaks, and the captcha works as usual.
+The embedded login/captcha pages are rendered by the system WebView, which relays their requests as system permission prompts attributed to the app; neither the app itself nor its embedded pages use any of these three capabilities.
+
 ## Build
 
 ```bash
