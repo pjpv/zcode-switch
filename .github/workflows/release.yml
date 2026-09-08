@@ -19,6 +19,9 @@ jobs:
             bundles: nsis
           - os: macos-latest
             bundles: dmg
+          - os: macos-latest
+            bundles: dmg
+            rust_target: x86_64-apple-darwin
           - os: ubuntu-latest
             bundles: deb,appimage
 
@@ -36,6 +39,8 @@ jobs:
           node-version: 20
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -51,10 +56,10 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'Z·SWITCH ${{ github.ref_name }}'
-          releaseBody: '见 [README](https://github.com/${{ github.repository }}/blob/main/README.md) 了解完整功能。Windows：`*_x64-setup.exe` 安装包（推荐）/ `*_portable.exe` 便携版；macOS：`*.dmg`；Linux：`*.deb` / `*.AppImage`。各平台均未签名：Windows SmartScreen 选「更多信息 → 仍要运行」，macOS Gatekeeper 右键打开，Linux AppImage 需 chmod +x。'
+          releaseBody: '见 [README](https://github.com/${{ github.repository }}/blob/main/README.md) 了解完整功能。Windows：`*_x64-setup.exe` 安装包（推荐）/ `*_portable.exe` 便携版；macOS：`*_aarch64.dmg`（Apple 芯片）/ `*_x64.dmg`（Intel 芯片）；Linux：`*.deb` / `*.AppImage`。各平台均未签名：Windows SmartScreen 选「更多信息 → 仍要运行」，macOS Gatekeeper 右键打开，Linux AppImage 需 chmod +x。'
           releaseDraft: false
           prerelease: false
-          args: --bundles ${{ matrix.bundles }}
+          args: --bundles ${{ matrix.bundles }} ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) || '' }}
 
       - name: Upload portable exe + checksums (windows)
         if: runner.os == 'Windows'
@@ -74,6 +79,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          find src-tauri/target/release/bundle -type f \( -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \) \
-            | xargs sha256sum | sed 's| .*/| |' > "checksums-${RUNNER_OS}-${GITHUB_REF_NAME}.txt"
-          gh release upload "$GITHUB_REF_NAME" "checksums-${RUNNER_OS}-${GITHUB_REF_NAME}.txt" --clobber
+          TGT="${{ matrix.rust_target }}"
+          [ -n "$TGT" ] || TGT="native"
+          find src-tauri/target -type f \( -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \) \
+            | xargs sha256sum | sed 's| .*/| |' > "checksums-${RUNNER_OS}-${TGT}-${GITHUB_REF_NAME}.txt"
+          gh release upload "$GITHUB_REF_NAME" "checksums-${RUNNER_OS}-${TGT}-${GITHUB_REF_NAME}.txt" --clobber
