@@ -40,7 +40,12 @@ fn detached(mut c: std::process::Command) -> std::process::Command {
 }
 
 pub struct Paths {
+    /// 用户主目录（%USERPROFILE%）。enc:v1 的密钥与 .zcode-switch 账号库都基于它，不能改。
     pub home: PathBuf,
+    /// ZCode 的数据根：取自 <home>/.zcode/v2/setting.json 的 dataBaseDir，未自定义时等于 home。
+    /// ZCode 把 credentials.json / config.json / telemetry-state.json / coding-plan-cache.json
+    /// 放在 <data_root>/.zcode/v2/ 下；而 setting.json 自身恒在 home 下。
+    pub data_root: PathBuf,
 }
 
 pub(crate) fn pick_home(zswitch: Option<PathBuf>, userprofile: Option<PathBuf>, home_env: Option<PathBuf>) -> PathBuf {
@@ -50,6 +55,50 @@ pub(crate) fn pick_home(zswitch: Option<PathBuf>, userprofile: Option<PathBuf>, 
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn abs_env_path(name: &str) -> Option<PathBuf> {
+    let raw = std::env::var(name).ok()?;
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(t);
+    p.is_absolute().then_some(p)
+}
+
+/// 读取 bootstrap 配置 <home>/.zcode/v2/setting.json 里的 dataBaseDir。
+fn bootstrap_data_base_dir(home: &Path) -> Option<PathBuf> {
+    fs::read_to_string(home.join(".zcode").join("v2").join("setting.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.get("dataBaseDir").and_then(|d| d.as_str()).map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute())
+}
+
+/// 解析 ZCode 的数据根目录。优先级刻意与 ZCode 主进程保持一致：
+///
+/// `getDataBaseDir() = setting.json.dataBaseDir || env.ZCODE_DATA_BASE_DIR || homedir()`
+///
+/// 数据文件一律落在 `<dataBaseDir>/.zcode/v2/` 下，只有 setting.json 自身恒在 home 下。
+/// 两者一旦不一致，zcode-switch 就会去写 home 下的僵尸副本 ——
+/// 界面显示"切换成功"，ZCode 里账号却纹丝不动（用户把「数据目录」改到别的盘后就会这样）。
+/// 因此这里对 setting.json 的值不做"目录是否存在"的猜测，取到就用，保证不会与 ZCode 分叉。
+///
+/// `ZCODE_SWITCH_DATA_ROOT` 是最高优先级的显式覆盖，供排查/测试使用。
+pub(crate) fn resolve_data_root(home: &Path) -> PathBuf {
+    if let Some(d) = abs_env_path("ZCODE_SWITCH_DATA_ROOT") {
+        return d;
+    }
+    if let Some(d) = bootstrap_data_base_dir(home) {
+        return d;
+    }
+    if let Some(d) = abs_env_path("ZCODE_DATA_BASE_DIR") {
+        return d;
+    }
+    home.to_path_buf()
+}
+
 impl Paths {
     pub fn detect() -> Paths {
         let home = pick_home(
@@ -57,17 +106,22 @@ impl Paths {
             std::env::var("USERPROFILE").ok().map(PathBuf::from),
             std::env::var("HOME").ok().map(PathBuf::from),
         );
-        Paths { home }
+        let data_root = resolve_data_root(&home);
+        Paths { home, data_root }
     }
+
+    /// ZCode 的实际数据根：<data_root>/.zcode
+    pub fn zcode_dir(&self) -> PathBuf { self.data_root.join(".zcode") }
 
     pub fn store_dir(&self) -> PathBuf { self.home.join(".zcode-switch") }
     pub fn accounts_dir(&self) -> PathBuf { self.store_dir().join("accounts") }
     pub fn settings_file(&self) -> PathBuf { self.store_dir().join("settings.json") }
-    pub fn live_file(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("credentials.json") }
-    pub fn live_config(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("config.json") }
-    pub fn live_telemetry(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("telemetry-state.json") }
+    pub fn live_file(&self) -> PathBuf { self.zcode_dir().join("v2").join("credentials.json") }
+    pub fn live_config(&self) -> PathBuf { self.zcode_dir().join("v2").join("config.json") }
+    pub fn live_telemetry(&self) -> PathBuf { self.zcode_dir().join("v2").join("telemetry-state.json") }
+    /// setting.json 是 bootstrap 文件（里面存着 dataBaseDir 本身），ZCode 永远从 home 根读它。
     pub fn live_setting(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("setting.json") }
-    pub fn live_plan_cache(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("coding-plan-cache.json") }
+    pub fn live_plan_cache(&self) -> PathBuf { self.zcode_dir().join("v2").join("coding-plan-cache.json") }
 
     pub fn ensure_dirs(&self) -> Result<(), String> {
         fs::create_dir_all(self.accounts_dir()).map_err(|e| trf("err.store.mk_accounts_dir", &[("e", &e.to_string())]))?;
@@ -211,6 +265,10 @@ pub fn is_logged_in(v: &Value) -> bool {
 }
 
 pub fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
+    // 目标父目录可能是 dataBaseDir 下尚未创建的 .zcode/v2，这里统一兜底
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| trf("err.mkdir", &[("e", &e.to_string())]))?;
+    }
     let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4().simple()));
     fs::write(&tmp, data).map_err(|e| trf("err.write_file", &[("path", &path.display().to_string()), ("e", &e.to_string())]))?;
     if let Err(e) = fs::rename(&tmp, path) {

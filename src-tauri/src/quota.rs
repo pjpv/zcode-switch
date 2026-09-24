@@ -45,7 +45,11 @@ pub(crate) fn device_mid() -> Option<String> {
                 std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from),
                 std::env::var("HOME").ok().map(std::path::PathBuf::from),
             );
-            let p = home.join(".zcode").join("v2").join("telemetry-state.json");
+            // telemetry-state.json 落在 ZCode 的数据根下（dataBaseDir），不是 home 根
+            let p = crate::store::resolve_data_root(&home)
+                .join(".zcode")
+                .join("v2")
+                .join("telemetry-state.json");
             std::fs::read_to_string(p)
                 .ok()
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
