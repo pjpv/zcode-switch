@@ -109,6 +109,13 @@ pub fn decode_jwt(jwt: &str) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+pub fn jwt_exp_ms(jwt: &str) -> Option<i64> {
+    let p = decode_jwt(jwt)?;
+    let exp = p.get("exp")?;
+    exp.as_i64().or_else(|| exp.as_f64().map(|f| f as i64))
+        .map(|s| s.saturating_mul(1000))
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Identity {
     pub provider: String,

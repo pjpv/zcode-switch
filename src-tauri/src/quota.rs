@@ -32,6 +32,22 @@ pub(crate) fn client_platform() -> String {
     format!("{os}-{arch}")
 }
 
+pub const BUILTIN_CODING_PLAN_MODELS: &[&str] = &["GLM-5.3", "GLM-5.3-Flash"];
+pub const BUILTIN_START_PLAN_MODELS: &[&str] = &["GLM-5.3-Flash", "GLM-5.2", "GLM-5-Turbo"];
+
+pub(crate) fn canonical_model_id(id: &str) -> String {
+    let lower = id.to_lowercase();
+    for m in BUILTIN_CODING_PLAN_MODELS
+        .iter()
+        .chain(BUILTIN_START_PLAN_MODELS.iter())
+    {
+        if m.to_lowercase() == lower {
+            return m.to_string();
+        }
+    }
+    id.to_string()
+}
+
 const ZCODE_ORIGIN: &str = "https://zcode.z.ai";
 pub(crate) const ZCODE_LANG: &str = "zh-CN";
 const ZCODE_CHANNEL: &str = "stable";
@@ -45,7 +61,10 @@ pub(crate) fn device_mid() -> Option<String> {
                 std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from),
                 std::env::var("HOME").ok().map(std::path::PathBuf::from),
             );
-            let p = home.join(".zcode").join("v2").join("telemetry-state.json");
+            let p = crate::store::resolve_data_root(&home)
+                .join(".zcode")
+                .join("v2")
+                .join("telemetry-state.json");
             std::fs::read_to_string(p)
                 .ok()
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -299,7 +318,19 @@ fn coding_plan_api_keys(config: Option<&Value>) -> Vec<String> {
     keys
 }
 
-pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str) -> Vec<String> {
+fn coding_plan_keys_from_creds(creds: &Value, secret: &str) -> Vec<String> {
+    let Some(map) = creds.as_object() else { return vec![] };
+    let mut out: Vec<String> = vec![];
+    for (k, v) in map {
+        if !k.starts_with("account-provider:") || !k.ends_with(":api-key") { continue; }
+        if !k.contains("coding-plan") { continue; }
+        let Some(p) = v.as_str().and_then(|v| safe_decrypt(Some(v), secret)) else { continue };
+        if looks_like_token(&p) && !out.contains(&p) { out.push(p); }
+    }
+    out
+}
+
+pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str, new_gen: bool) -> Vec<String> {
     let mut tokens: Vec<String> = vec![];
     let add = |plain: Option<String>, tokens: &mut Vec<String>| {
         if let Some(p) = plain {
@@ -308,6 +339,12 @@ pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str) -> 
             }
         }
     };
+    let creds_keys = coding_plan_keys_from_creds(creds, secret);
+    if new_gen {
+        for k in &creds_keys {
+            add(Some(k.clone()), &mut tokens);
+        }
+    }
     for k in coding_plan_api_keys(config) {
         tokens.push(k);
     }
@@ -330,6 +367,11 @@ pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str) -> 
             map.and_then(|m| m.get(&key)).and_then(|v| v.as_str()).and_then(|v| safe_decrypt(Some(v), secret)),
             &mut tokens,
         );
+    }
+    if !new_gen {
+        for k in creds_keys {
+            add(Some(k), &mut tokens);
+        }
     }
     tokens
 }
@@ -445,10 +487,24 @@ fn query_with_token(token: &str) -> Result<QuotaOverview, String> {
     query_with_token_via(token, &|url, tok| http_get_json(url, tok, true))
 }
 
-fn business_ok(v: &Value) -> bool {
+pub(crate) fn business_ok(v: &Value) -> bool {
     let code = v.get("code").and_then(|c| c.as_i64());
     let success = v.get("success").and_then(|s| s.as_bool());
     (code.is_none() || code == Some(200) || code == Some(0)) && success != Some(false)
+}
+
+pub(crate) fn is_active_coding_plan_entry(s: &Value) -> bool {
+    let coding_name = ["productId", "productName"].iter().any(|k| {
+        s.get(k)
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_lowercase().contains("coding"))
+            .unwrap_or(false)
+    });
+    if !coding_name {
+        return false;
+    }
+    s.get("inCurrentPeriod").and_then(|v| v.as_bool()) == Some(true)
+        && s.get("status").and_then(|v| v.as_str()) == Some("VALID")
 }
 
 pub fn query_quota(tokens: &[String]) -> Result<QuotaOverview, String> {
@@ -482,12 +538,12 @@ pub fn query_quota(tokens: &[String]) -> Result<QuotaOverview, String> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Channel {
+pub(crate) enum Channel {
     Monitor(String),
     ZaiBilling(String),
 }
 
-fn is_no_plan_message(msg: &str) -> bool {
+pub(crate) fn is_no_plan_message(msg: &str) -> bool {
     msg.contains("不存在coding plan") || msg.contains("没有资格")
 }
 
@@ -520,8 +576,36 @@ pub(crate) fn zai_billing_token(creds: &Value, config: Option<&Value>, secret: &
     None
 }
 
-fn pick_channels(creds: &Value, config: Option<&Value>, secret: &str) -> Vec<Channel> {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum BizErrFamily { Auth, QuotaExhausted, RateLimited, SecurityReject, Param, Server, Unknown }
+
+pub(crate) fn classify_biz_err(code: i64) -> BizErrFamily {
+    use BizErrFamily::*;
+    match code {
+        401 | 1006 => Auth,
+        1005 => QuotaExhausted,
+        3002 | 3008 | 3009 | 3010 => RateLimited,
+        3007 => SecurityReject,
+        3001 | 3006 | 3102 => Param,
+        2007 => Server,
+        _ => Unknown,
+    }
+}
+
+pub(crate) fn pick_channels(creds: &Value, config: Option<&Value>, secret: &str, new_gen: bool) -> Vec<Channel> {
     let mut chans: Vec<Channel> = vec![];
+    if new_gen {
+        for k in coding_plan_keys_from_creds(creds, secret) {
+            if !chans.contains(&Channel::Monitor(k.clone())) {
+                chans.push(Channel::Monitor(k));
+            }
+        }
+        if let Some(t) = zai_billing_token(creds, config, secret) {
+            if !chans.contains(&Channel::ZaiBilling(t.clone())) {
+                chans.push(Channel::ZaiBilling(t));
+            }
+        }
+    }
     let providers = match config.and_then(|c| c.get("provider")).and_then(|p| p.as_object()) {
         Some(p) => p,
         None => return chans,
@@ -559,6 +643,13 @@ fn pick_channels(creds: &Value, config: Option<&Value>, secret: &str) -> Vec<Cha
                 if !chans.contains(&Channel::Monitor(k.clone())) {
                     chans.push(Channel::Monitor(k));
                 }
+            }
+        }
+    }
+    if !new_gen {
+        for k in coding_plan_keys_from_creds(creds, secret) {
+            if !chans.contains(&Channel::Monitor(k.clone())) {
+                chans.push(Channel::Monitor(k));
             }
         }
     }
@@ -711,13 +802,14 @@ fn query_channels(channels: &[Channel]) -> Result<QuotaOverview, String> {
 
 pub fn quota_for_live(home: &Path, creds: &Value, config: Option<&Value>) -> Result<QuotaOverview, String> {
     let secret = zcrypto::default_secret(home);
-    let channels = pick_channels(creds, config, &secret);
+    let new_gen = crate::store::new_gen_provider_config(home);
+    let channels = pick_channels(creds, config, &secret, new_gen);
     if !channels.is_empty() {
         if let Ok(ov) = query_channels(&channels) {
             return Ok(ov);
         }
     }
-    let tokens = candidate_tokens(creds, config, &secret);
+    let tokens = candidate_tokens(creds, config, &secret, new_gen);
     query_quota(&tokens)
 }
 
@@ -940,11 +1032,7 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
             if let Some(arr) = sub.get("data").and_then(|d| d.as_array()) {
                 let current = arr
                     .iter()
-                    .find(|s| {
-                        let valid = s.get("status").and_then(|x| x.as_str()) == Some("VALID");
-                        let in_period = s.get("inCurrentPeriod").and_then(|x| x.as_bool()).unwrap_or(true);
-                        valid && in_period
-                    })
+                    .find(|s| is_active_coding_plan_entry(s))
                     .or_else(|| arr.first());
                 if let Some(s) = current {
                     if let Some(pn) = s.get("productName").and_then(|x| x.as_str()) {

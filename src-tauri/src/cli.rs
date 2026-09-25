@@ -139,7 +139,15 @@ pub fn run(args: &[String]) -> (String, i32) {
                 settings.hot_switch()
             };
             match switch_to(&paths, &id, force, restart, hot) {
-                Ok(r) => ok(serde_json::to_value(&r).unwrap_or(Value::Null)),
+                Ok(r) => {
+                    if let Some(p) = &r.probe {
+                        let msg = crate::probe::probe_message(p);
+                        if !msg.is_empty() {
+                            eprintln!("{msg}");
+                        }
+                    }
+                    ok(serde_json::to_value(&r).unwrap_or(Value::Null))
+                }
                 Err(e) => return (err(&e), 1),
             }
         }

@@ -41,6 +41,7 @@ fn detached(mut c: std::process::Command) -> std::process::Command {
 
 pub struct Paths {
     pub home: PathBuf,
+    pub data_root: PathBuf,
 }
 
 pub(crate) fn pick_home(zswitch: Option<PathBuf>, userprofile: Option<PathBuf>, home_env: Option<PathBuf>) -> PathBuf {
@@ -50,6 +51,39 @@ pub(crate) fn pick_home(zswitch: Option<PathBuf>, userprofile: Option<PathBuf>, 
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn abs_env_path(name: &str) -> Option<PathBuf> {
+    let raw = std::env::var(name).ok()?;
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(t);
+    p.is_absolute().then_some(p)
+}
+
+fn bootstrap_data_base_dir(home: &Path) -> Option<PathBuf> {
+    fs::read_to_string(home.join(".zcode").join("v2").join("setting.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.get("dataBaseDir").and_then(|d| d.as_str()).map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute())
+}
+
+pub(crate) fn resolve_data_root(home: &Path) -> PathBuf {
+    if let Some(d) = abs_env_path("ZCODE_SWITCH_DATA_ROOT") {
+        return d;
+    }
+    if let Some(d) = bootstrap_data_base_dir(home) {
+        return d;
+    }
+    if let Some(d) = abs_env_path("ZCODE_DATA_BASE_DIR") {
+        return d;
+    }
+    home.to_path_buf()
+}
+
 impl Paths {
     pub fn detect() -> Paths {
         let home = pick_home(
@@ -57,17 +91,19 @@ impl Paths {
             std::env::var("USERPROFILE").ok().map(PathBuf::from),
             std::env::var("HOME").ok().map(PathBuf::from),
         );
-        Paths { home }
+        let data_root = resolve_data_root(&home);
+        Paths { home, data_root }
     }
 
     pub fn store_dir(&self) -> PathBuf { self.home.join(".zcode-switch") }
     pub fn accounts_dir(&self) -> PathBuf { self.store_dir().join("accounts") }
     pub fn settings_file(&self) -> PathBuf { self.store_dir().join("settings.json") }
-    pub fn live_file(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("credentials.json") }
-    pub fn live_config(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("config.json") }
-    pub fn live_telemetry(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("telemetry-state.json") }
+    pub fn zcode_dir(&self) -> PathBuf { self.data_root.join(".zcode") }
+    pub fn live_file(&self) -> PathBuf { self.zcode_dir().join("v2").join("credentials.json") }
+    pub fn live_config(&self) -> PathBuf { self.zcode_dir().join("v2").join("config.json") }
+    pub fn live_telemetry(&self) -> PathBuf { self.zcode_dir().join("v2").join("telemetry-state.json") }
     pub fn live_setting(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("setting.json") }
-    pub fn live_plan_cache(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("coding-plan-cache.json") }
+    pub fn live_plan_cache(&self) -> PathBuf { self.zcode_dir().join("v2").join("coding-plan-cache.json") }
 
     pub fn ensure_dirs(&self) -> Result<(), String> {
         fs::create_dir_all(self.accounts_dir()).map_err(|e| trf("err.store.mk_accounts_dir", &[("e", &e.to_string())]))?;
@@ -131,6 +167,7 @@ pub struct AccountSummary {
     pub is_active: bool,
     pub has_config: bool,
     pub has_user_info: bool,
+    pub jwt_expired: bool,
     pub identity: zcrypto::Identity,
 }
 
@@ -166,6 +203,8 @@ pub struct SwitchResult {
     pub hot: bool,
     #[serde(default)]
     pub config_stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<crate::probe::ProbeOutcome>,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -211,6 +250,9 @@ pub fn is_logged_in(v: &Value) -> bool {
 }
 
 pub fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| trf("err.mkdir", &[("e", &e.to_string())]))?;
+    }
     let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4().simple()));
     fs::write(&tmp, data).map_err(|e| trf("err.write_file", &[("path", &path.display().to_string()), ("e", &e.to_string())]))?;
     if let Err(e) = fs::rename(&tmp, path) {
@@ -239,6 +281,14 @@ pub fn read_live_config(paths: &Paths) -> Option<Value> {
     serde_json::from_str(&raw).ok()
 }
 
+pub(crate) fn new_gen_provider_config(data_root: &Path) -> bool {
+    data_root.join(".zcode").join("v2").join("provider_config.json").exists()
+}
+
+fn snapshot_config_from_live(paths: &Paths) -> Option<Value> {
+    if new_gen_provider_config(&paths.data_root) { None } else { read_live_config(paths) }
+}
+
 pub fn write_live(paths: &Paths, v: &Value) -> Result<(), String> {
     if let Some(parent) = paths.live_file().parent() {
         fs::create_dir_all(parent).map_err(|e| trf("err.mkdir", &[("e", &e.to_string())]))?;
@@ -252,7 +302,7 @@ pub fn write_live_config(paths: &Paths, v: &Value) -> Result<(), String> {
     atomic_write(&paths.live_config(), &body)
 }
 
-fn in_sandbox() -> bool {
+pub(crate) fn in_sandbox() -> bool {
     std::env::var("ZCODE_SWITCH_HOME").is_ok()
 }
 
@@ -528,7 +578,7 @@ pub fn capture_current(paths: &Paths, name: Option<String>) -> Result<Account, S
     if let Some(i) = find_same_login(&live, &hash, &accounts, &paths.home) {
         return Err(trf("err.live.dup_saved", &[("name", &accounts[i].name)]));
     }
-    let config = read_live_config(paths);
+    let config = snapshot_config_from_live(paths);
     let name = match name {
         Some(n) => unique_name(&accounts, &n),
         None => {
@@ -587,7 +637,7 @@ fn auto_preserve(paths: &Paths, accounts: &[Account], target_hash: &str) -> Resu
         updated_at: ts,
         hash,
         credentials: live,
-        config: read_live_config(paths),
+        config: snapshot_config_from_live(paths),
         virtual_device_mid: None,
         virtual_arms_uid: None,
     };
@@ -603,6 +653,15 @@ fn cred_plain(creds: &Value, key: &str, home: &std::path::Path) -> Option<String
     } else {
         Some(v.to_string())
     }
+}
+
+pub(crate) const JWT_CLOCK_SKEW_MS: i64 = 30_000;
+
+pub(crate) fn account_jwt_expired(creds: &Value, home: &Path) -> bool {
+    let Some(jwt) = cred_plain(creds, "zcodejwttoken", home) else { return false };
+    let Some(exp) = zcrypto::jwt_exp_ms(&jwt) else { return false };
+    let now_ms = Local::now().timestamp_millis();
+    exp <= now_ms + JWT_CLOCK_SKEW_MS
 }
 
 fn sync_live_back_to_source(paths: &Paths, accounts: &[Account]) -> Result<(), String> {
@@ -624,7 +683,7 @@ fn sync_live_back_to_source(paths: &Paths, accounts: &[Account]) -> Result<(), S
         src.hash = live_hash;
         changed = true;
     }
-    if src.config.is_some() {
+    if !new_gen_provider_config(&paths.data_root) && src.config.is_some() {
         let cfg = read_live_config(paths);
         if cfg.is_some() && cfg != src.config {
             src.config = cfg;
@@ -680,8 +739,10 @@ fn rematerialize_wiped_builtins(paths: &Paths, target: &Account) {
             .map(|k| k.as_str().map(str::trim).unwrap_or("").is_empty())
             .unwrap_or(true)
             || (cur.get("enabled").and_then(|e| e.as_bool()) == Some(false)
-                && cur.get("systemDisabledReason").and_then(|s| s.as_str())
-                    == Some("oauth_provider_inactive"))
+                && matches!(
+                    cur.get("systemDisabledReason").and_then(|s| s.as_str()),
+                    Some("oauth_provider_inactive") | Some("coding_plan_auth_failed")
+                ))
     };
     let family_prefix = format!("builtin:{provider}");
 
@@ -732,6 +793,26 @@ fn rematerialize_wiped_builtins(paths: &Paths, target: &Account) {
     }
 }
 
+fn run_switch_probe(paths: &Paths, target: &Account, mid: Option<String>) -> Option<crate::probe::ProbeOutcome> {
+    if in_sandbox() || !is_logged_in(&target.credentials) {
+        return None;
+    }
+    let cfg = probe_config_base(paths, target);
+    crate::probe::switch_probe(
+        &target.credentials,
+        cfg.as_ref(),
+        &zcrypto::default_secret(&paths.home),
+        mid,
+        new_gen_provider_config(&paths.data_root),
+    )
+}
+
+fn probe_config_base(paths: &Paths, target: &Account) -> Option<Value> {
+    if target.config.is_none() { return None; }
+    if new_gen_provider_config(&paths.data_root) { target.config.clone() }
+    else { read_live_config(paths).or_else(|| target.config.clone()) }
+}
+
 pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool) -> Result<SwitchResult, String> {
     let target = load_account(paths, id)?;
     let accounts = list_accounts(paths)?;
@@ -769,6 +850,7 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
             launched: false,
             hot: false,
             config_stale: false,
+            probe: None,
         });
     }
 
@@ -786,6 +868,7 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
         write_live_device_mid(paths, &mid)?;
         ensure_virtual_arms_uid_locked(paths, &target.id)?;
+        let probe = run_switch_probe(paths, &target, Some(mid));
         return Ok(SwitchResult {
             switched: true,
             already_active: false,
@@ -795,6 +878,7 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
             launched: false,
             hot: true,
             config_stale: target.config.is_none() && paths.live_config().exists(),
+            probe,
         });
     }
 
@@ -819,12 +903,23 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
     let creds = inject_relay_pass_hash(&target.credentials, current_relay_pass(paths).as_ref());
     write_live(paths, &creds)?;
     backfill_relay_pass_hash(paths, &target.id, &creds);
+    let new_gen = new_gen_provider_config(&paths.data_root);
+    if new_gen {
+        eprintln!(
+            "[zsw] 新代际配置（provider_config.json 在）：跳过 config.json 写入与重物化（注册表版本 {}）",
+            crate::quota::zcode_app_version()
+        );
+    }
     if let Some(cfg) = &target.config {
-        write_live_config(paths, cfg)?;
+        if !new_gen {
+            write_live_config(paths, cfg)?;
+        }
     }
     reset_live_plan_cache(paths);
     align_family_domain(paths, &target);
-    rematerialize_wiped_builtins(paths, &target);
+    if !new_gen {
+        rematerialize_wiped_builtins(paths, &target);
+    }
     let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
     write_live_device_mid(paths, &mid)?;
     let uid = ensure_virtual_arms_uid_locked(paths, &target.id)?;
@@ -838,6 +933,8 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         }
     }
 
+    let probe = run_switch_probe(paths, &target, Some(mid));
+
     Ok(SwitchResult {
         switched: true,
         already_active: false,
@@ -847,6 +944,7 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         launched,
         hot: false,
         config_stale: target.config.is_none() && paths.live_config().exists(),
+        probe,
     })
 }
 
@@ -898,10 +996,12 @@ fn hot_swap_verified(paths: &Paths, target: &Account, creds: &Value) -> Result<(
             continue;
         }
         if let Some(cfg) = &target.config {
-            if let Err(e) = write_live_config(paths, cfg) {
-                last_err = Some(trf("err.write_config", &[("e", &e)]));
-                backoff(attempt);
-                continue;
+            if !new_gen_provider_config(&paths.data_root) {
+                if let Err(e) = write_live_config(paths, cfg) {
+                    last_err = Some(trf("err.write_config", &[("e", &e)]));
+                    backoff(attempt);
+                    continue;
+                }
             }
         }
         if let Ok(Some(v)) = read_live(paths) {
@@ -993,10 +1093,16 @@ pub fn update_account_from_live(paths: &Paths, id: &str) -> Result<Account, Stri
     let mut acc = load_account(paths, id)?;
     acc.hash = hash;
     acc.credentials = live;
-    acc.config = read_live_config(paths);
+    if !new_gen_provider_config(&paths.data_root) {
+        acc.config = read_live_config(paths);
+    }
     acc.updated_at = now_ts();
     save_account(paths, &acc)?;
     Ok(acc)
+}
+
+fn live_quota_config(paths: &Paths) -> Option<Value> {
+    if new_gen_provider_config(&paths.data_root) { None } else { read_live_config(paths) }
 }
 
 pub fn live_quota(paths: &Paths) -> Result<quota::QuotaOverview, String> {
@@ -1004,7 +1110,7 @@ pub fn live_quota(paths: &Paths) -> Result<quota::QuotaOverview, String> {
     if !is_logged_in(&creds) {
         return Err(tr("err.live.quota"));
     }
-    quota::quota_for_live(&paths.home, &creds, read_live_config(paths).as_ref())
+    quota::quota_for_live(&paths.home, &creds, live_quota_config(paths).as_ref())
 }
 
 pub fn account_quota(paths: &Paths, id: &str) -> Result<quota::QuotaOverview, String> {
@@ -1393,6 +1499,7 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
             is_active: live_hash.as_deref() == Some(a.hash.as_str()),
             has_config: a.config.is_some(),
             has_user_info: crate::claim::telemetry_user_id(&paths.home, &a.credentials).is_some(),
+            jwt_expired: account_jwt_expired(&a.credentials, &paths.home),
             identity: zcrypto::account_identity(&a.credentials, &paths.home),
         })
         .collect();

@@ -4,6 +4,7 @@ pub mod i18n;
 mod claim;
 mod flowlog;
 mod oauth;
+mod probe;
 mod quota;
 mod store;
 mod zcrypto;
