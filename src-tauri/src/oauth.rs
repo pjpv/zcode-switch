@@ -21,6 +21,144 @@ pub const OAUTH_PROVIDERS: &[OAuthProvider] = &[
 
 const REDIRECT_ENC: &str = "zcode%3A%2F%2Foauth%2Fcallback";
 
+/// z.ai 官网登录入口（官网 OAuth client：邮箱 / 第三方登录方式齐全）。
+/// zcode 的 API 授权 client 只放手机号登录，所以 zai 入口先用这个页面建立 chat.z.ai 会话，
+/// 登录成功后（回调 z.ai/login/callback）再接力到本次 flow 的 authorize_url 取码。
+pub const ZAI_LOGIN_ENTRY_URL: &str = "https://chat.z.ai/auth?response_type=code&client_id=client_lS94_Ka2ycE9IwCNYisudg&redirect_uri=https%3A%2F%2Fz.ai%2Flogin%2Fcallback%3Fredirect%3D%2525252Fmodel-api&state=1790259680634";
+
+/// z.ai 登录窗口内的辅助按钮条：一键切到官网「邮箱登录 / 邮箱注册」。
+/// zcode 的 API 授权 client 只放手机号登录，邮箱入口只在官网 client 登录页（ZAI_LOGIN_ENTRY_URL）才有；
+/// 被接力带到手机号页后点这两个按钮即可回到邮箱表单，找不到入口时先回官网页再自动点一次。
+const ZAI_EMAIL_ASSIST_JS: &str = r##"(function () {
+  var ENTRY = __ZSW_ENTRY__;
+  var LBL = {
+    login: __ZSW_LABEL_EMAIL_LOGIN__,
+    signup: __ZSW_LABEL_EMAIL_SIGNUP__,
+    already: __ZSW_LABEL_ALREADY__,
+    alreadySignup: __ZSW_LABEL_ALREADY_SIGNUP__
+  };
+  // 登录表单和注册表单都有邮箱输入框，只能靠表单特征文案区分，不能只看 input[type=email]
+  var PAGE = {
+    email: ['邮箱登录', 'Email Login', 'Email login', 'Sign in with Email', 'Sign in with email'],
+    signup: ['注册', 'Sign up', 'Sign Up', 'Register'],
+    signupForm: ['创建账号', '已经拥有账号了？', 'Create account', 'Create Account', 'Already have an account'],
+    loginForm: ['忘记密码？', 'Forgot password', 'Forgot password?'],
+    toLogin: ['登录', 'Sign in', 'Sign In']
+  };
+  var INTENT_KEY = 'zsw_email_assist_intent';
+  var BAR_ID = 'zsw-email-assist';
+  var BTN_STYLE = 'cursor:pointer;border:1px solid rgba(255,255,255,.3);background:rgba(20,20,24,.88);color:#fff;border-radius:999px;padding:6px 12px;font:12px/1 system-ui,sans-serif;white-space:nowrap';
+  var findText = function (txt) {
+    var bar = document.getElementById(BAR_ID);
+    var all = document.querySelectorAll('button,a');
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (bar && bar.contains(el)) continue;
+      if ((el.innerText || '').trim() === txt && el.offsetParent !== null) return el;
+    }
+    return null;
+  };
+  var findAny = function (list) {
+    for (var i = 0; i < list.length; i++) {
+      var el = findText(list[i]);
+      if (el) return el;
+    }
+    return null;
+  };
+  var hint = function (msg) {
+    var bar = document.getElementById(BAR_ID);
+    var t = bar && bar.querySelector('[data-hint]');
+    if (!t) return;
+    t.textContent = msg;
+    t.style.opacity = '1';
+    setTimeout(function () { t.style.opacity = '0'; }, 1800);
+  };
+  var openEmail = function (signup) {
+    var onSignup = findAny(PAGE.signupForm);
+    var onLogin = findAny(PAGE.loginForm);
+    if (signup) {
+      if (onSignup) { hint(LBL.alreadySignup); return; }
+      var toSignup = onLogin ? findAny(PAGE.signup) : null;
+      if (toSignup) { toSignup.click(); return; }
+    } else {
+      if (onLogin) { hint(LBL.already); return; }
+      var toLogin = onSignup ? findAny(PAGE.toLogin) : null;
+      if (toLogin) { toLogin.click(); return; }
+    }
+    var btn = findAny(PAGE.email);
+    if (btn) {
+      btn.click();
+      if (signup) setTimeout(function () { var r = findAny(PAGE.signup); if (r) r.click(); }, 800);
+      return;
+    }
+    try { sessionStorage.setItem(INTENT_KEY, signup ? 'signup' : 'login'); } catch (e) {}
+    location.href = ENTRY;
+  };
+  var consume = function () {
+    var intent;
+    try { intent = sessionStorage.getItem(INTENT_KEY); } catch (e) { return; }
+    if (!intent) return;
+    var tries = 0;
+    var timer = setInterval(function () {
+      if (++tries > 40) { clearInterval(timer); return; }
+      var btn = findAny(PAGE.email);
+      if (!btn) return;
+      clearInterval(timer);
+      try { sessionStorage.removeItem(INTENT_KEY); } catch (e) {}
+      btn.click();
+      if (intent === 'signup') {
+        var n = 0;
+        var t2 = setInterval(function () {
+          if (++n > 20) { clearInterval(t2); return; }
+          var r = findAny(PAGE.signup);
+          if (r) { clearInterval(t2); r.click(); }
+        }, 300);
+      }
+    }, 300);
+  };
+  var render = function () {
+    if (document.getElementById(BAR_ID) || !document.body) return;
+    var bar = document.createElement('div');
+    bar.id = BAR_ID;
+    bar.setAttribute('style', 'position:fixed;top:10px;right:10px;z-index:2147483647;display:flex;flex-direction:column;align-items:flex-end;gap:6px');
+    var mk = function (label, signup) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      b.setAttribute('style', BTN_STYLE);
+      b.addEventListener('click', function (ev) { ev.preventDefault(); ev.stopPropagation(); openEmail(signup); });
+      return b;
+    };
+    var wrap = document.createElement('div');
+    wrap.setAttribute('style', 'display:flex;gap:6px');
+    wrap.appendChild(mk(LBL.login, false));
+    wrap.appendChild(mk(LBL.signup, true));
+    var t = document.createElement('div');
+    t.setAttribute('data-hint', '1');
+    t.setAttribute('style', 'opacity:0;transition:opacity .2s;background:rgba(20,20,24,.9);color:#fff;border-radius:6px;padding:5px 9px;font:11px/1.2 system-ui,sans-serif');
+    bar.appendChild(wrap);
+    bar.appendChild(t);
+    document.body.appendChild(bar);
+  };
+  var bootTries = 0;
+  var boot = function () {
+    if (document.body) { render(); consume(); return; }
+    if (++bootTries > 50) return;
+    setTimeout(boot, 100);
+  };
+  boot();
+})();"##;
+
+pub fn zai_email_assist_script() -> String {
+    let lit = |s: String| serde_json::Value::String(s).to_string();
+    ZAI_EMAIL_ASSIST_JS
+        .replace("__ZSW_ENTRY__", &lit(ZAI_LOGIN_ENTRY_URL.to_string()))
+        .replace("__ZSW_LABEL_EMAIL_LOGIN__", &lit(crate::i18n::tr("login.assist.email")))
+        .replace("__ZSW_LABEL_EMAIL_SIGNUP__", &lit(crate::i18n::tr("login.assist.signup")))
+        .replace("__ZSW_LABEL_ALREADY__", &lit(crate::i18n::tr("login.assist.hint")))
+        .replace("__ZSW_LABEL_ALREADY_SIGNUP__", &lit(crate::i18n::tr("login.assist.hint_signup")))
+}
+
 pub fn bridge_redirect_uri() -> String {
     format!("https://zcode.z.ai/app/oauth/login?redirect={REDIRECT_ENC}&app_version={}", quota::CLIENT_APP_VERSION)
 }
@@ -36,6 +174,8 @@ fn urlencode(s: &str) -> String {
 
 pub struct FlowInit {
     pub authorize_url: String,
+    /// 服务端原始 authorize_url（未经入口形态规范化）：已登录时直接发码，用于 zai 第二段接力
+    pub raw_authorize_url: String,
     pub state: String,
     pub poll_url: String,
     pub poll_token: String,
@@ -77,8 +217,12 @@ fn init_flow_at(url: &str, provider: &str, mid: &str) -> Result<FlowInit, String
     let data = v.get("data").ok_or_else(invalid)?;
     let flow_id = data.get("flow_id").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty())
         .ok_or_else(invalid)?;
-    let authorize = data.get("authorize_url").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty())
+    let authorize_raw = data.get("authorize_url").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty())
         .ok_or_else(invalid)?;
+    let authorize = match normalize_zai_authorize_entry(provider, authorize_raw) {
+        Some(u) => u,
+        None => authorize_raw.to_string(),
+    };
     let poll_token = data
         .get("poll_token")
         .and_then(|x| x.as_str())
@@ -114,12 +258,53 @@ fn init_flow_at(url: &str, provider: &str, mid: &str) -> Result<FlowInit, String
         .map_err(|_| invalid())?;
     Ok(FlowInit {
         authorize_url: auth_url.to_string(),
+        raw_authorize_url: authorize_raw.to_string(),
         state,
         poll_url: format!("{init_base}/api/v1/oauth/cli/poll/{}", urlencode(flow_id)),
         poll_token,
         expires_at_ms,
         poll_interval_ms,
     })
+}
+
+/// z.ai 登录窗口入口规范化：服务端下发的 `https://chat.z.ai/api/oauth/authorize?...` 本身
+/// 会 307 跳到官网登录页 `/auth`，这里直接以 `/auth` 形态打开（参数按官网排布、redirect_uri 做百分号编码）。
+/// client_id / redirect_uri / state 必须沿用本次 flow 的服务端下发值，否则登录无法回调 zcode、
+/// 服务端 flow 不会 ready，账号也就无法入库。
+fn normalize_zai_authorize_entry(provider: &str, raw: &str) -> Option<String> {
+    if provider != "zai" {
+        return None;
+    }
+    let u: tauri::Url = raw.parse().ok()?;
+    if u.host_str() != Some("chat.z.ai") || u.path() != "/api/oauth/authorize" {
+        return None;
+    }
+    let pick = |key: &str| {
+        u.query_pairs()
+            .find(|(k, _)| k.as_ref() == key)
+            .map(|(_, v)| v.into_owned())
+    };
+    let response_type = pick("response_type").unwrap_or_else(|| "code".to_string());
+    let client_id = pick("client_id")?;
+    let redirect_uri = pick("redirect_uri")?;
+    let state = pick("state")?;
+    let mut out = format!(
+        "https://chat.z.ai/auth?response_type={}&client_id={}&redirect_uri={}&state={}",
+        urlencode(&response_type),
+        urlencode(&client_id),
+        urlencode(&redirect_uri),
+        urlencode(&state),
+    );
+    for (k, v) in u
+        .query_pairs()
+        .filter(|(k, _)| !matches!(k.as_ref(), "response_type" | "client_id" | "redirect_uri" | "state"))
+    {
+        out.push('&');
+        out.push_str(&urlencode(&k));
+        out.push('=');
+        out.push_str(&urlencode(&v));
+    }
+    Some(out)
 }
 
 #[derive(Debug)]

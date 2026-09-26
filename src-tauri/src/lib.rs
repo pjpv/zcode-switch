@@ -418,13 +418,23 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
             .unwrap_or(0);
         let srv_flow = init.poll_url.rsplit('/').next().unwrap_or("");
         let expires_in = init.expires_at_ms.saturating_sub(now) / 1000;
+        let authorize = init.authorize_url.split('?').next().unwrap_or("");
+        let mode = if provider == "zai" { "official-login+relay" } else { "direct" };
         flowlog::log(
             &flow,
             "init-ok",
-            &format!("server_flow={srv_flow} expires_in={expires_in}s interval={}ms", init.poll_interval_ms),
+            &format!("mode={mode} authorize={authorize} server_flow={srv_flow} expires_in={expires_in}s interval={}ms", init.poll_interval_ms),
         );
     }
-    let url = init.authorize_url.clone();
+    // zai 第二段接力用服务端原始授权端点（已登录时直接发码；未登录它自己会 307 到登录页）
+    let url = init.raw_authorize_url.clone();
+    // zai：API 授权 client 没有邮箱入口，先用官网登录页建立 chat.z.ai 会话，
+    // 登录完成后再接力到这个授权端点取码（已登录 → 不再要求手机号）
+    let entry_url = if provider == "zai" {
+        oauth::ZAI_LOGIN_ENTRY_URL.to_string()
+    } else {
+        url.clone()
+    };
     let poll_cfg = PollCfg {
         url: init.poll_url.clone(),
         token: init.poll_token.clone(),
@@ -448,10 +458,19 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
     let app2 = app.clone();
     let (provider2, state2, flow2, mid2) = (provider.clone(), init.state.clone(), flow.clone(), mid.clone());
     let flow_close = flow.clone();
+    let relay_to = url.clone();
+    let relay_to2 = url.clone();
+    let relay_armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(provider == "zai"));
+    let relay_armed2 = relay_armed.clone();
+    let relay_armed3 = relay_armed.clone();
+    let flow_relay = flow.clone();
+    let flow_relay2 = flow.clone();
+    let flow_nav = flow.clone();
+    let log_nav = provider == "zai";
     let mut builder = tauri::WebviewWindowBuilder::new(
         &app,
         "login",
-        tauri::WebviewUrl::External(url.parse::<tauri::Url>().map_err(|e| i18n::trf("err.oauth.bad_authorize_url", &[("e", &e.to_string())]))?),
+        tauri::WebviewUrl::External(entry_url.parse::<tauri::Url>().map_err(|e| i18n::trf("err.oauth.bad_authorize_url", &[("e", &e.to_string())]))?),
     )
     .title(i18n::tr("title.login"))
     .theme(Some(tauri::Theme::Dark))
@@ -463,17 +482,81 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
     if let Some(u) = proxy_url {
         builder = builder.proxy_url(u);
     }
+    // z.ai：官网登录页有邮箱入口，但 API 授权 client 的兜底页只放手机号；
+    // 页面每次加载后注入按钮条，用户随时可切回邮箱登录 / 邮箱注册
+    if provider == "zai" {
+        let assist = oauth::zai_email_assist_script();
+        let assist_load = assist.clone();
+        let flow_load = flow.clone();
+        builder = builder.on_page_load(move |wv, payload| {
+            if let tauri::webview::PageLoadEvent::Finished = payload.event() {
+                flowlog::log(&flow_load, "assist", "inject on-page-load");
+                let _ = wv.eval(&assist_load);
+            }
+        });
+        // 首次导航可能早于 on_page_load 注册生效，窗口起来后再补几次注入（脚本幂等，重复执行无副作用）
+        let app_assist = app.clone();
+        let flow_assist = flow.clone();
+        std::thread::spawn(move || {
+            let mut logged = false;
+            for _ in 0..10 {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                let ours = pending_oauth_guard().as_ref().map(|p| p.flow == flow_assist).unwrap_or(false);
+                if !ours {
+                    return;
+                }
+                let Some(w) = app_assist.get_webview_window("login") else { return };
+                if w.eval(&assist).is_ok() && !logged {
+                    flowlog::log(&flow_assist, "assist", "inject boost");
+                    logged = true;
+                }
+            }
+        });
+    }
     builder
     .on_navigation(move |url| {
-        if url.scheme() != "zcode" {
-            return true;
+        if url.scheme() == "zcode" {
+            let full = url.to_string();
+            let (app3, p3, s3, f3, m3) = (app2.clone(), provider2.clone(), state2.clone(), flow2.clone(), mid2.clone());
+            tauri::async_runtime::spawn(async move {
+                finish_oauth(&app3, p3, s3, f3, m3, &full).await;
+            });
+            return false;
         }
-        let full = url.to_string();
-        let (app3, p3, s3, f3, m3) = (app2.clone(), provider2.clone(), state2.clone(), flow2.clone(), mid2.clone());
-        tauri::async_runtime::spawn(async move {
-            finish_oauth(&app3, p3, s3, f3, m3, &full).await;
-        });
-        false
+        if log_nav && url.host_str().map_or(false, |h| h.ends_with("z.ai")) {
+            flowlog::log(&flow_nav, "nav", &format!("{}{}", url.host_str().unwrap_or(""), url.path()));
+        }
+        // 窗口内「邮箱登录 / 邮箱注册」按钮会把用户带回官网入口页，此时重新武装接力：
+        // 接力默认只有一次机会，手动绕回登录页后若不再武装，登录成功也不会取码
+        if url.host_str() == Some("chat.z.ai")
+            && url.path() == "/auth"
+            && url.query().map_or(false, |q| q.contains("client_id="))
+        {
+            relay_armed2.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        // zai 第一段（官网登录页）完成 → 接力到本次 flow 的授权页取码（此时已登录，不再要求手机号）
+        if url.host_str().map_or(false, |h| h == "z.ai" || h.ends_with(".z.ai"))
+            && !is_login_page(url.path())
+            && relay_armed2.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            flowlog::log(
+                &flow_relay,
+                "zai-relay",
+                &format!("nav {}{} -> authorize", url.host_str().unwrap_or(""), url.path()),
+            );
+            let target = relay_to.clone();
+            let app4 = app2.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                if let Some(w) = app4.get_webview_window("login") {
+                    if let Ok(t) = target.parse::<tauri::Url>() {
+                        let _ = w.navigate(t);
+                    }
+                }
+            });
+            log_after_relay(app2.clone(), flow_relay.clone(), 5000);
+        }
+        true
     })
     .build()
     .map_err(|e| {
@@ -496,8 +579,65 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
             }
         });
     }
+    // 官网登录成功后走的是 SPA 内部路由（history.replaceState），on_navigation 收不到事件，
+    // 所以再加一路轮询窗口 URL 兜底：一旦离开登录页、落到 z.ai 站点即接力取码
+    if provider == "zai" {
+        let app_relay = app.clone();
+        let armed = relay_armed3;
+        let target = relay_to2;
+        let fl = flow_relay2;
+        let guard_flow = flow.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                let ours = pending_oauth_guard().as_ref().map(|p| p.flow == guard_flow).unwrap_or(false);
+                if !ours || !armed.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let Some(w) = app_relay.get_webview_window("login") else { return };
+                let Ok(u) = w.url() else { continue };
+                let host = u.host_str().unwrap_or("");
+                if !(host == "z.ai" || host.ends_with(".z.ai")) || is_login_page(u.path()) {
+                    continue;
+                }
+                if !armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    return; // 已被 on_navigation 那路接力
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1200)); // 留点时间让官网把回调收尾
+                flowlog::log(&fl, "zai-relay", &format!("poll {host}{} -> authorize", u.path()));
+                if let Ok(t) = target.parse::<tauri::Url>() {
+                    let _ = w.navigate(t);
+                }
+                log_after_relay(app_relay.clone(), fl.clone(), 5000);
+                return;
+            }
+        });
+    }
     spawn_poll_loop(app.clone(), provider.clone(), flow.clone(), mid, poll_cfg);
     Ok(json!({ "opened": true, "provider": provider }))
+}
+
+/// 接力后留痕：几秒后把窗口实际落点写进日志，便于判断授权是否成功
+fn log_after_relay(app: AppHandle, flow: String, delay_ms: u64) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        if let Some(w) = app.get_webview_window("login") {
+            if let Ok(u) = w.url() {
+                flowlog::log(&flow, "zai-after", &format!("{}{}", u.host_str().unwrap_or(""), u.path()));
+            }
+        }
+    });
+}
+
+/// 登录 / 注册相关路径：说明还没登录完成，zai 接力不能在这些页面触发
+fn is_login_page(path: &str) -> bool {
+    if path.starts_with("/login/callback") {
+        return false; // 登录回跳页：登录已完成
+    }
+    ["/auth", "/login", "/signin", "/sign-in", "/signup", "/sign-up", "/register", "/reset", "/forgot"]
+        .iter()
+        .any(|p| path.starts_with(p))
 }
 
 fn sweep_login_profiles(root: &std::path::Path) {
