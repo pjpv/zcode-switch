@@ -14,6 +14,7 @@ A Tauri 2 desktop tool for one-click switching between multiple ZCode accounts, 
 - **Claim promotions**: one-click claim for eligible promotions; "Auto claim" toggle (off by default) checks and claims periodically — manual actions take priority
 - **Encrypted import / export**: `.zsb` bundle, PBKDF2(100k) + AES-256-GCM password encryption
 - **Bilingual UI (中文 / English)**: one-click switch in Settings — main window, tray, error messages and CLI output all covered; first run follows your OS language
+- **In-app updates**: the main window notices a new version; download and install from Settings
 - **Tray / autostart / CLI automation**
 
 ## Security Design
@@ -24,6 +25,7 @@ A Tauri 2 desktop tool for one-click switching between multiple ZCode accounts, 
 - **Path traversal protection**: account id whitelist (`[A-Za-z0-9-]`); delete/read cannot escape the account store directory
 - **Encrypted export**: PBKDF2-HMAC-SHA256 (100k iterations) + AES-256-GCM, random salt/nonce; wrong password simply fails, no plaintext traces
 - **Credentials decrypted locally only**: decryption is used solely to display username/email; export files are password-encrypted
+- **Update verification**: in-app updates download only from this repo's GitHub Releases and check the published SHA-256 before installing or opening the package
 
 ## CLI
 

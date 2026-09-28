@@ -3,12 +3,17 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
+import { bindUpdateProgress, checkAppUpdate, confirmAndInstall } from "./update.js";
 
 const $app = document.getElementById("app");
 let state = null;
 let renaming = null;
 let busy = false;
 let appVer = "";
+let updateOffer = null;
+let updateDismissed = false;
+let updateBusy = false;
+let updateDetail = "";
 let acctQuota = {};
 let claimable = {};
 let claimAllRunning = false;
@@ -286,6 +291,28 @@ const actions = {
     try { await invoke("open_settings"); }
     catch (e) { toast(stripErr(e), "err"); }
   },
+
+  installUpdate() {
+    if (!updateOffer?.available || updateBusy) return;
+    confirmAndInstall(updateOffer, {
+      onStart() {
+        updateBusy = true;
+        updateDetail = t("u.downloading");
+        if (!uiLocked()) render();
+      },
+      onEnd() {
+        updateBusy = false;
+        updateDetail = "";
+        if (!uiLocked()) render();
+      },
+    });
+  },
+
+  dismissUpdate() {
+    updateDismissed = true;
+    if (!uiLocked()) render();
+  },
+
   acctQuota(id) {
     const dueAt = quotaDue[id];
     loadAcctQuota(id).then(() => {
@@ -737,6 +764,17 @@ function restoreScroll(cap) {
   }
 }
 
+function updateBanner() {
+  if (!updateOffer?.available || updateDismissed) return "";
+  const label = updateOffer.prerelease ? t("u.foundPre", { ver: updateOffer.latest }) : t("u.found", { ver: updateOffer.latest });
+  const btn = updateOffer.installable ? t("u.install") : t("u.openPage");
+  return `<div class="update-banner" role="status">
+    <span class="banner-text">${esc(updateDetail || label)}</span>
+    <button class="btn-primary" data-update-act click="actions.installUpdate()" ${updateBusy ? "disabled" : ""}>${esc(btn)}</button>
+    <button class="btn-ghost" click="actions.dismissUpdate()">${esc(t("u.later"))}</button>
+  </div>`;
+}
+
 function render() {
   const scrollCap = captureScroll();
   if (!state) {
@@ -819,6 +857,7 @@ function render() {
         <span class="status-text">${esc(statusText)}</span>
       </div>
     </header>
+    ${updateBanner()}
 
     <section class="toolbar">
       <button class="btn-primary has-ic${unsaved ? " attention" : ""}" click="actions.capture()" ${!s.live_logged_in || active ? "disabled" : ""}
@@ -976,6 +1015,17 @@ async function sweepTick() {
     appVer = await invoke("app_version").catch(() => "");
     await refresh();
     render();
+    bindUpdateProgress((text) => {
+      updateDetail = text;
+      const el = document.querySelector(".update-banner .banner-text");
+      if (el) el.textContent = text;
+    });
+    checkAppUpdate().then((info) => {
+      if (info?.available) {
+        updateOffer = info;
+        if (!uiLocked()) render();
+      }
+    }).catch(() => {});
     await invoke("reveal_main");
     setTimeout(dismissSplash, 350);
     enrollAccounts();

@@ -7,6 +7,7 @@ mod oauth;
 mod probe;
 mod quota;
 mod store;
+mod updater;
 mod zcrypto;
 
 use serde_json::{json, Value};
@@ -1123,6 +1124,26 @@ async fn open_external(url: String) -> Result<(), String> {
     store::open_url(&url)
 }
 
+#[tauri::command]
+async fn check_app_update(app: AppHandle) -> Result<updater::UpdateCheck, String> {
+    let current = app.package_info().version.to_string();
+    let exe = std::env::current_exe().ok();
+    match tauri::async_runtime::spawn_blocking(move || updater::check(&current, exe.as_deref())).await {
+        Ok(r) => r,
+        Err(e) => Err(i18n::trf("err.update.apply", &[("e", &e.to_string())])),
+    }
+}
+
+#[tauri::command]
+async fn install_app_update(app: AppHandle) -> Result<updater::UpdateApply, String> {
+    let current = app.package_info().version.to_string();
+    let exe = std::env::current_exe().map_err(|e| i18n::trf("err.update.apply", &[("e", &e.to_string())]))?;
+    match tauri::async_runtime::spawn_blocking(move || updater::install(app, &current, &exe)).await {
+        Ok(r) => r,
+        Err(e) => Err(i18n::trf("err.update.apply", &[("e", &e.to_string())])),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1168,6 +1189,8 @@ pub fn run() {
             set_zcode_path,
             launch_zcode,
             open_external,
+            check_app_update,
+            install_app_update,
             open_settings,
             reveal_main,
         ])
