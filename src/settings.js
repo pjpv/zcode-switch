@@ -3,12 +3,46 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, lang, stripErr } from "./i18n.js";
+import { bindUpdateProgress, checkAppUpdate, confirmAndInstall } from "./update.js";
 
 const $app = document.getElementById("app");
 let state = null;
 let autostart = false;
 let busy = false;
 let appVer = "";
+let updateInfo = null;
+let updatePhase = "checking";
+let updateError = "";
+let updateDetail = "";
+let updateBusy = false;
+
+function updateStatusText() {
+  if (updateDetail) return updateDetail;
+  if (updatePhase === "checking") return t("s.updateChecking");
+  if (updatePhase === "error") return updateError || t("s.updateFail");
+  if (updateInfo?.available) {
+    return updateInfo.prerelease ? t("u.foundPre", { ver: updateInfo.latest }) : t("u.found", { ver: updateInfo.latest });
+  }
+  if (updatePhase === "ready") return t("s.updateLatest", { ver: appVer || updateInfo?.current || "" });
+  return t("s.updateChecking");
+}
+
+async function runCheck(manual) {
+  updatePhase = "checking";
+  updateError = "";
+  updateDetail = "";
+  render();
+  try {
+    updateInfo = await checkAppUpdate();
+    updatePhase = "ready";
+  } catch (e) {
+    updateInfo = null;
+    updatePhase = "error";
+    updateError = stripErr(e);
+    if (manual) toast(updateError, "err");
+  }
+  render();
+}
 
 async function refresh() {
   state = await invoke("get_state");
@@ -131,6 +165,24 @@ const actions = {
     });
   },
 
+  async checkUpdate() { await runCheck(true); },
+
+  installUpdate() {
+    if (!updateInfo?.available || updateBusy) return;
+    confirmAndInstall(updateInfo, {
+      onStart() {
+        updateBusy = true;
+        updateDetail = t("u.downloading");
+        render();
+      },
+      onEnd() {
+        updateBusy = false;
+        updateDetail = "";
+        render();
+      },
+    });
+  },
+
   async saveProxy() {
     const input = document.querySelector(".settings input.auth-proxy");
     if (!input) return;
@@ -196,6 +248,15 @@ function render() {
         <button class="btn-ghost" click="actions.browsePath()">${t("s.browse")}</button>
         <button class="btn-ghost" click="actions.savePath()">${t("common.save")}</button>
       </div>
+      <label style="margin-top:14px">${t("s.updateLabel")}</label>
+      <div class="upd-box">
+        <div class="upd-status">${esc(updateStatusText())}</div>
+        ${updateInfo?.available && updateInfo.notes ? `<div class="upd-notes">${esc(updateInfo.notes)}</div>` : ""}
+        <div class="upd-actions">
+          <button class="btn-ghost" data-update-act click="actions.checkUpdate()" ${updatePhase === "checking" || updateBusy ? "disabled" : ""}>${t("s.updateCheck")}</button>
+          ${updateInfo?.available ? `<button class="btn-primary" data-update-act click="actions.installUpdate()" ${updateBusy ? "disabled" : ""}>${updateInfo.installable ? t("s.updateInstall") : t("s.updateOpen")}</button>` : ""}
+        </div>
+      </div>
       <div class="hint">${t("s.hint")}</div>
       <div class="gh-row"><a class="gh-link" href="https://github.com/pjpv/zcode-switch" target="_blank" rel="noopener" click="actions.openGitHub()">${t("s.githubLink")}</a>${appVer ? `<span class="ver">v${esc(appVer)}</span>` : ""}</div>
     </section>`;
@@ -210,12 +271,19 @@ listen("state-changed", () => {
   refresh().then(render).catch(() => {});
 });
 
+bindUpdateProgress((text) => {
+  updateDetail = text;
+  const el = document.querySelector(".upd-status");
+  if (el) el.textContent = text;
+});
+
 (async () => {
   try {
     appVer = await invoke("app_version").catch(() => "");
     await refresh();
     render();
     dismissSplash();
+    runCheck(false);
   } catch (e) {
     $app.innerHTML = `<div class="loading" style="color:var(--red)">${t("common.loadFail", { e: esc(String(e)) })}</div>`;
     dismissSplash();

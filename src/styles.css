@@ -479,6 +479,47 @@ input:focus-visible,
 }
 .gh-link:hover { text-decoration: underline; }
 
+.update-banner {
+  margin: 10px 18px 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border: 1px solid #4a3d22;
+  border-radius: 8px;
+  background: rgba(232, 163, 61, .08);
+  font-size: 14px;
+}
+.update-banner .banner-text { flex: 1 1 160px; min-width: 0; }
+.update-banner .btn-ghost,
+.update-banner .btn-primary {
+  height: 32px;
+  padding: 0 12px;
+  flex: none;
+}
+.upd-box { margin-top: 4px; }
+.upd-status {
+  font-size: 14.5px;
+  color: var(--ink);
+  line-height: 1.5;
+}
+.upd-notes {
+  margin-top: 8px;
+  max-height: 120px;
+  overflow: auto;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--ink-dim);
+  white-space: pre-wrap;
+  border: 1px solid var(--hairline-soft);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.upd-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.upd-actions .btn-ghost,
+.upd-actions .btn-primary { height: 34px; }
+
 .toast-zone {
   position: fixed;
   left: 50%;

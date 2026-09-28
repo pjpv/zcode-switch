@@ -214,6 +214,21 @@ const ZH: &[(&str, &str)] = &[
     ("cli.read_fail", "读取失败：{e}"),
     ("cli.json_fail", "JSON 解析失败：{e}"),
     ("err.lang.unknown", "未知语言：{lang}（支持 zh / en）"),
+    ("err.update.rate", "GitHub 接口繁忙，请稍后再试"),
+    ("err.update.http", "请求失败（HTTP {code}）"),
+    ("err.update.network", "网络请求失败：{e}"),
+    ("err.update.parse", "无法解析发布信息"),
+    ("err.update.bad_version", "无法识别当前版本号"),
+    ("err.update.none", "没有可安装的更新"),
+    ("err.update.no_asset", "没有适用于当前系统的安装包"),
+    ("err.update.checksum_missing", "发布包缺少 SHA-256 校验和，已取消安装"),
+    ("err.update.checksum_mismatch", "安装包校验失败，已取消安装"),
+    ("err.update.too_big", "安装包过大，已取消下载"),
+    ("err.update.download", "下载失败：{e}"),
+    ("err.update.apply", "无法启动安装：{e}"),
+    ("err.update.path", "安装路径异常，已取消安装"),
+    ("err.update.busy", "正在安装更新"),
+    ("err.update.write", "无法写入更新文件：{e}"),
 ];
 
 const EN: &[(&str, &str)] = &[
@@ -371,6 +386,21 @@ const EN: &[(&str, &str)] = &[
     ("cli.read_fail", "Read failed: {e}"),
     ("cli.json_fail", "JSON parse failed: {e}"),
     ("err.lang.unknown", "Unknown language: {lang} (supported: zh / en)"),
+    ("err.update.rate", "GitHub is rate-limiting requests — try again shortly"),
+    ("err.update.http", "Request failed (HTTP {code})"),
+    ("err.update.network", "Network request failed: {e}"),
+    ("err.update.parse", "Could not parse the release feed"),
+    ("err.update.bad_version", "The current version number is not recognized"),
+    ("err.update.none", "No update to install"),
+    ("err.update.no_asset", "This release has no package for the current system"),
+    ("err.update.checksum_missing", "The release has no SHA-256 checksum — installation cancelled"),
+    ("err.update.checksum_mismatch", "The package failed its checksum — installation cancelled"),
+    ("err.update.too_big", "The package is too large — download cancelled"),
+    ("err.update.download", "Download failed: {e}"),
+    ("err.update.apply", "Could not start the installer: {e}"),
+    ("err.update.path", "The install path is not usable — installation cancelled"),
+    ("err.update.busy", "An update is already being installed"),
+    ("err.update.write", "Could not write the update file: {e}"),
 ];
 
 fn table_for(lang: Lang) -> &'static [(&'static str, &'static str)] {
