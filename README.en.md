@@ -45,6 +45,12 @@ CLI password (export / import): prefer the `ZSW_PASSWORD` environment variable (
 
 ## FAQ
 
+### Slow refreshes or a failed verification configuration request?
+
+Quota, plan preview and eligibility refreshes share a limit of 3 concurrent requests. Manual actions take priority over background quota refreshes. Failed accounts retain error details and can be retried individually. Bulk eligibility refresh retains its 60-second cooldown; individual retries are independent of that cooldown.
+
+Successful CAPTCHA configuration is cached in memory for 5 minutes, with at most one retry for a transport failure. A failed setup offers Retry in the manual verification window; batch claims retain the failed account and continue with the others. Claim submissions are not automatically replayed, and interactive verification still requires the user.
+
 ### macOS asks for Microphone / Accessibility / Screen Recording permission?
 
 Deny all of them — nothing breaks.

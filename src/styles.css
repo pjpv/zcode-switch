@@ -973,7 +973,7 @@ input:focus-visible,
   word-break: break-all;
   min-height: 19px;
 }
-#cap-btn {
+#cap-btn, #cap-retry {
   font-family: var(--body);
   font-size: 14px;
   font-weight: 600;
@@ -984,8 +984,10 @@ input:focus-visible,
   border: 1px solid var(--amber);
   color: var(--amber-ink);
 }
-#cap-btn:hover { background: #f0b055; }
-#cap-btn:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+#cap-btn:hover, #cap-retry:hover { background: #f0b055; }
+#cap-btn:focus-visible, #cap-retry:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+.claim-error { color: var(--red); }
+.claim-error .claim-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cap-foot {
   position: absolute;
   bottom: 12px;

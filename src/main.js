@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
+import { createRequestQueue } from "./request-queue.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -11,6 +12,11 @@ let busy = false;
 let appVer = "";
 let acctQuota = {};
 let claimable = {};
+const request = createRequestQueue(3);
+const quotaRequests = new Map();
+const previewRequests = new Map();
+const eligibilityRequests = new Map();
+const claimFailures = {};
 let claimAllRunning = false;
 const REFRESH_CLAIM_COOLDOWN_MS = 60_000;
 let refreshClaim = { running: false, done: 0, total: 0, cooldownUntil: 0 };
@@ -75,50 +81,94 @@ async function guard(fn) {
   }
 }
 
-async function loadAcctQuota(id) {
+function loadAcctQuota(id, priority = true) {
+  if (quotaRequests.has(id)) {
+    if (priority) request(`quota:${id}`, () => {}, true);
+    return quotaRequests.get(id);
+  }
   const cur = acctQuota[id] || {};
-  if (cur.busy) return;
-  acctQuota[id] = { busy: true };
+  acctQuota[id] = { ...cur, busy: true };
   if (!uiLocked()) render();
+  const work = request(`quota:${id}`, async () => {
   try {
     const data = await invoke("get_account_quota", { id });
     acctQuota[id] = { data, err: null, busy: false };
   } catch (e) {
-    acctQuota[id] = { data: null, err: stripErr(e), busy: false };
+    acctQuota[id] = { data: cur.data, err: stripErr(e), busy: false };
   }
   if (!uiLocked()) render();
+  }, priority).finally(() => quotaRequests.delete(id));
+  quotaRequests.set(id, work);
+  return work;
 }
 
-async function loadClaimPreview(id) {
+function loadClaimPreview(id) {
+  if (eligibilityRequests.has(id)) return eligibilityRequests.get(id);
+  if (previewRequests.has(id)) return previewRequests.get(id);
   const cur = claimable[id] || {};
-  if (cur.busy) return;
   claimable[id] = { plans: cur.plans || [], busy: true };
+  const work = request(`preview:${id}`, async () => {
   try {
     const plans = await invoke("claim_preview", { id });
     claimable[id] = { plans: plans || [], err: null, busy: false };
   } catch (e) {
     claimable[id] = { plans: cur.plans || [], err: String(e), busy: false };
   }
+  }, true).finally(() => previewRequests.delete(id));
+  previewRequests.set(id, work);
+  return work;
+}
+
+function refreshEligibility(id) {
+  if (eligibilityRequests.has(id)) return eligibilityRequests.get(id);
+  const previous = previewRequests.get(id);
+  const work = Promise.resolve(previous).then(() => {
+    claimable[id] = { ...(claimable[id] || {}), busy: true };
+    if (!uiLocked()) render();
+    return request(`eligibility:${id}`, async () => {
+      try {
+        const r = await invoke("claim_refresh", { id });
+        claimable[id] = { plans: r.plans || [], err: r.activationError ? stripErr(r.activationError) : null, busy: false };
+        return r;
+      } catch (e) {
+        claimable[id] = { plans: claimable[id]?.plans || [], err: stripErr(e), busy: false };
+        throw e;
+      }
+    }, true);
+  }).finally(() => eligibilityRequests.delete(id));
+  eligibilityRequests.set(id, work);
+  return work;
 }
 
 let claimWaiter = null;
-function waitForClaimResult(accountId, timeoutMs = 90000) {
+function waitForClaimResult(accountId, claimId, timeoutMs = 90000) {
   return new Promise((resolve) => {
     let done = false;
     const finish = (v) => { if (!done) { done = true; claimWaiter = null; clearTimeout(t); resolve(v); } };
     const t = setTimeout(() => finish(null), timeoutMs);
-    claimWaiter = { accountId, finish };
+    claimWaiter = { accountId, claimId, finish };
   });
 }
 
-async function awaitClaimPreviewFresh(id) {
-  claimable[id] = { ...(claimable[id] || {}), busy: true };
+async function performClaim(id, plan, auto = false, timeoutMs = 90000) {
+  const claimId = crypto.randomUUID();
+  // Register before opening the WebView: setup can fail (or verification can
+  // finish) before claim_start returns to this window.
+  const result = waitForClaimResult(id, claimId, timeoutMs);
   try {
-    const plans = await invoke("claim_preview", { id });
-    claimable[id] = { plans: plans || [], err: null, busy: false };
+    await invoke("claim_start", { id, planId: plan.plan_id, auto, claimId });
   } catch (e) {
-    claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
+    if (claimWaiter?.claimId === claimId) claimWaiter.finish({ ok: false });
+    claimFailures[id] = stripErr(e);
+    throw e;
   }
+  const r = await result;
+  if (!r) {
+    await invoke("claim_cancel", { claimId }).catch(() => {});
+    claimFailures[id] = t("m.claimTimeout");
+  }
+  if (!uiLocked()) render();
+  return r;
 }
 
 const accountName = (id) => (state?.accounts || []).find((a) => a.id === id)?.name || id;
@@ -311,20 +361,19 @@ const actions = {
   },
 
   async claim(id) {
-    if (claimActive || claimAllRunning || refreshClaim.running) { toast(t("m.claimBusy"), "warn"); return; }
+    if (claimActive || claimAllRunning || refreshClaim.running || autoClaimRunning) { toast(t("m.claimBusy"), "warn"); return; }
     const plans = claimable[id]?.plans || [];
     const plan = plans[0];
     if (!plan) { toast(t("m.noClaimable"), "warn"); return; }
     claimActive = true;
     try {
-      await invoke("claim_start", { id, planId: plan.plan_id });
-      toast(t("m.claimVerify", { name: plan.name || plan.plan_id }), "ok", t("m.claimVerifyDetail"));
-      const r = await waitForClaimResult(id);
+      const r = await performClaim(id, plan);
       if (!r) toast(t("m.claimTimeout"), "warn");
     } catch (e) {
       toast(stripErr(e), "err");
     } finally {
       claimActive = false;
+      if (!uiLocked()) render();
     }
   },
 
@@ -342,30 +391,27 @@ const actions = {
         const plan = claimable[id].plans[0];
         const name = state.accounts.find((a) => a.id === id)?.name || id;
         try {
-          await invoke("claim_start", { id, planId: plan.plan_id });
+          const r = await performClaim(id, plan, false, 120000);
+          if (!r) toast(t("m.claimAcctTimeout", { name }), "warn");
         } catch (e) {
           toast(t("m.claimAccountErr", { name, err: stripErr(e) }), "err");
           continue;
-        }
-        const r = await waitForClaimResult(id, 120000);
-        if (!r) {
-          toast(t("m.claimAcctTimeout", { name }), "warn");
-          await invoke("claim_cancel").catch(() => {});
         }
         if (i < ids.length - 1) await new Promise((res) => setTimeout(res, 1200));
       }
     } finally {
       claimAllRunning = false;
       claimActive = false;
+      if (!uiLocked()) render();
     }
   },
 
-  async refreshClaim() {
-    const ids = (state?.accounts || []).map((a) => a.id);
+  async refreshClaim(onlyId) {
+    const ids = (state?.accounts || []).map((a) => a.id).filter((id) => !onlyId || id === onlyId);
     if (!ids.length) return;
     const now = Date.now();
     if (refreshClaim.running || claimAllRunning || (claimActive && !autoClaimRunning)) return;
-    if (now < refreshClaim.cooldownUntil) {
+    if (!onlyId && now < refreshClaim.cooldownUntil) {
       toast(t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - now) / 1000) }), "warn");
       return;
     }
@@ -386,33 +432,27 @@ const actions = {
       }
     }
     let okCount = 0;
+    let failedCount = 0;
     try {
-      for (let i = 0; i < ids.length; i++) {
-        const id = ids[i];
-        const name = state.accounts.find((a) => a.id === id)?.name || id;
-        refreshClaim.done = i + 1;
-        claimable[id] = { plans: claimable[id]?.plans || [], busy: true };
-        if (!uiLocked()) render();
+      await Promise.all(ids.map(async (id) => {
         try {
-          const r = await invoke("claim_refresh", { id });
-          claimable[id] = { plans: r.plans || [], err: null, busy: false };
+          const r = await refreshEligibility(id);
           if ((r.plans || []).length) okCount++;
-          if (r.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(r.activationError) }), "warn");
+          if (r.activationError) failedCount++;
         } catch (e) {
-          claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
-          toast(t("m.refreshClaimAcctErr", { name, err: stripErr(e) }), "err");
+          failedCount++;
+        } finally {
+          refreshClaim.done++;
+          if (!uiLocked()) render();
         }
-        scheduleNext(id);
-        if (!uiLocked()) render();
-        if (i < ids.length - 1) await new Promise((res) => setTimeout(res, 5000));
-      }
+      }));
     } finally {
       refreshClaim.running = false;
       refreshClaim.cooldownUntil = Date.now() + REFRESH_CLAIM_COOLDOWN_MS;
       if (!uiLocked()) render();
       setTimeout(stopRefreshTickerIfIdle, 1100);
     }
-    toast(t("m.refreshClaimDone", { n: ids.length, k: okCount }), "ok");
+    toast(t("m.refreshClaimDone", { n: ids.length, k: okCount, failed: failedCount }), failedCount ? "warn" : "ok");
   },
 
   async toggleAutoClaim() {
@@ -482,8 +522,7 @@ async function autoClaimTick() {
       let gotAny = false;
       claimable[id] = { ...(claimable[id] || {}), busy: true };
       try {
-        const r = await invoke("claim_refresh", { id });
-        claimable[id] = { plans: r.plans || [], err: null, busy: false };
+        await refreshEligibility(id);
       } catch (e) {
         claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
         autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
@@ -499,16 +538,14 @@ async function autoClaimTick() {
         progressed = false;
         const plan = claimable[id]?.plans?.[0];
         if (!plan) break;
+        let r;
         try {
-          await invoke("claim_start", { id, planId: plan.plan_id, auto: true });
+          r = await performClaim(id, plan, true, AUTO_CLAIM_WAIT_MS);
         } catch (e) {
-          await invoke("claim_cancel").catch(() => {});
           autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
           break;
         }
-        const r = await waitForClaimResult(id, AUTO_CLAIM_WAIT_MS);
         if (!r) {
-          await invoke("claim_cancel").catch(() => {});
           autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
           break;
         }
@@ -517,7 +554,7 @@ async function autoClaimTick() {
           break;
         }
         gotAny = true; roundClaimed++;
-        await awaitClaimPreviewFresh(id);
+        await loadClaimPreview(id);
         if (!uiLocked()) render();
         progressed = true;
         await new Promise((res) => setTimeout(res, 1200));
@@ -633,15 +670,21 @@ function grantLabel(plan) {
 function claimStripHtml(id) {
   const c = claimable[id];
   const plan = c?.plans?.[0];
-  if (!plan) return "";
+  const failure = claimFailures[id] || c?.err;
+  const disabled = claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning || c?.busy;
+  const error = failure ? `<div class="claim-strip claim-error" title="${esc(failure)}">
+    <span class="claim-name">${esc(failure)}</span>
+    <button class="btn-claim" click="actions.${claimFailures[id] && plan ? "claim" : "refreshClaim"}('${id}')" ${disabled ? "disabled" : ""}>${t("btn.retry")}</button>
+  </div>` : "";
+  if (!plan) return error;
   const grants = grantLabel(plan);
   const label = plan.name || plan.plan_id;
-  return `
+  return error + `
   <div class="claim-strip" title="${esc(plan.description || label)}">
     ${ic("gift", 15)}
     <span class="claim-name">${esc(label)}</span>
     ${grants ? `<span class="claim-grants">${esc(grants)}</span>` : ""}
-    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>
+    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${disabled ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>
   </div>`;
 }
 
@@ -694,7 +737,7 @@ function acctQuotaSlot(id) {
     inner = `<span class="aq-loading">${t("q.loading")}</span>`;
   } else if (q?.err) {
     const msg = q.err.length > 46 ? q.err.slice(0, 46) + "…" : q.err;
-    inner = `<span class="aq-err">${esc(msg)}</span>`;
+    inner = `<span class="aq-err" title="${esc(q.err)}">${esc(msg)}</span>`;
   } else if (q?.data) {
     const plans = q.data.plans || [];
     if (plans.length >= 2) {
@@ -881,14 +924,17 @@ listen("tray-action", (ev) => {
 
 listen("claim://result", (ev) => {
   const p = ev.payload || {};
-  if (claimWaiter && claimWaiter.accountId === p.accountId) claimWaiter.finish(p);
+  if (!claimWaiter || claimWaiter.claimId !== p.claimId) return;
+  claimWaiter.finish(p);
   if (p.ok === false) {
+    claimFailures[p.accountId] = p.message || t("m.unknownErr");
     let msg = p.message || t("m.unknownErr");
     if (p.code === 1005 && p.nextAt) {
       msg += t("m.claimNextAt", { time: new Date(p.nextAt).toLocaleString(localeTag(), { hour12: false }) });
     }
     toast(t("m.claimFailed", { name: p.accountName, msg }), "err");
   } else {
+    delete claimFailures[p.accountId];
     const bits = [];
     const now = p.serverTime || Date.now();
     if (p.startsAt && p.startsAt > now) bits.push(t("m.claimStartsAt", { time: new Date(p.startsAt).toLocaleString(localeTag(), { hour12: false }) }));
@@ -904,13 +950,32 @@ listen("claim://result", (ev) => {
   }
 });
 
-listen("captcha://interactive", () => {
-  if (!autoClaimRunning || !claimWaiter) return;
-  const id = claimWaiter.accountId;
-  invoke("claim_cancel").catch(() => {});
+listen("claim://cancelled", (ev) => {
+  const p = ev.payload || {};
+  if (claimWaiter?.claimId !== p.claimId) return;
+  claimFailures[p.accountId] = t("m.claimCancelled");
+  claimWaiter.finish({ ok: false, code: "cancelled" });
+});
+
+listen("captcha://failed", async (ev) => {
+  const p = ev.payload || {};
+  if (!claimWaiter || claimWaiter.claimId !== p.claimId) return;
+  claimFailures[claimWaiter.accountId] = p.message || t("c.cfgFail");
+  if (!autoClaimRunning && !claimAllRunning && !p.terminal) { if (!uiLocked()) render(); return; }
+  const waiter = claimWaiter;
+  await invoke("claim_cancel", { claimId: waiter.claimId }).catch(() => {});
+  waiter.finish({ ok: false, code: "setup", message: p.message });
+});
+
+listen("captcha://interactive", async (ev) => {
+  if (!autoClaimRunning || !claimWaiter || claimWaiter.claimId !== ev.payload?.claimId) return;
+  const waiter = claimWaiter;
+  const id = waiter.accountId;
+  await invoke("claim_cancel", { claimId: waiter.claimId }).catch(() => {});
   autoClaimCooldown[id] = Date.now() + 60 * 60 * 1000;
   toast(t("m.autoClaimInteractive", { name: accountName(id) }), "warn", t("m.autoClaimInteractiveDetail"));
-  claimWaiter.finish({ ok: false, code: "interactive" });
+  claimFailures[id] = t("c.interactive");
+  waiter.finish({ ok: false, code: "interactive" });
 });
 
 listen("oauth://done", (ev) => {
@@ -956,16 +1021,17 @@ async function sweepTick() {
   if (ticking) return;
   enrollAccounts();
   const now = Date.now();
-  const due = (state?.accounts || []).find(
+  const due = (state?.accounts || []).filter(
     (a) => (quotaDue[a.id] ?? Infinity) <= now && !acctQuota[a.id]?.busy && !claimable[a.id]?.busy,
   );
-  if (!due) return;
+  if (!due.length) return;
   ticking = true;
-  const dueAt = quotaDue[due.id];
   try {
-    await loadAcctQuota(due.id);
-    if (quotaDue[due.id] === dueAt) scheduleNext(due.id);
-    if (!uiLocked()) render();
+    await Promise.all(due.map(async ({ id }) => {
+      const dueAt = quotaDue[id];
+      await loadAcctQuota(id, false);
+      if (quotaDue[id] === dueAt) scheduleNext(id);
+    }));
   } finally {
     ticking = false;
   }

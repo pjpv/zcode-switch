@@ -2,6 +2,7 @@
 use crate::zcrypto;
 use serde_json::Value;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -378,10 +379,11 @@ pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str, new
 
 fn http_get_json(url: &str, token: &str, retry_429: bool) -> Result<Value, String> {
     let retry_delays = [500u64, 1500, 4000];
-    let agent = ureq::AgentBuilder::new()
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    let agent = AGENT.get_or_init(|| ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
-        .build();
+        .build());
     let headers = if url.contains("zcode.z.ai") {
         zai_billing_headers(token)
     } else {
@@ -407,8 +409,8 @@ fn http_get_json(url: &str, token: &str, retry_429: bool) -> Result<Value, Strin
             Err(ureq::Error::Status(code, r)) => {
                 let body = r.into_string().unwrap_or_default();
                 if let Ok(v) = serde_json::from_str::<Value>(&body) {
-                    if v.get("code").and_then(|c| c.as_i64()) == Some(401) {
-                        return Err(crate::i18n::tr("err.token.biz401"));
+                    if matches!(v.get("code").and_then(|c| c.as_i64()), Some(401 | 1006)) {
+                        return Ok(v);
                     }
                 }
                 if code == 429 {
@@ -421,7 +423,10 @@ fn http_get_json(url: &str, token: &str, retry_429: bool) -> Result<Value, Strin
                         None => return Err(last_err.unwrap_or_else(|| crate::i18n::tr("err.quota.http429"))),
                     }
                 }
-                if code == 401 || code == 403 {
+                if code == 401 {
+                    return Ok(serde_json::json!({ "code": 401 }));
+                }
+                if code == 403 {
                     return Err(crate::i18n::trf("err.token.http401", &[("code", &code.to_string())]));
                 }
                 let msg = serde_json::from_str::<Value>(&body)
@@ -483,10 +488,6 @@ fn query_with_token_via(token: &str, fetch: &FetchFn) -> Result<QuotaOverview, S
     Err(best_err.unwrap_or_else(|| crate::i18n::tr("err.quota.fail")))
 }
 
-fn query_with_token(token: &str) -> Result<QuotaOverview, String> {
-    query_with_token_via(token, &|url, tok| http_get_json(url, tok, true))
-}
-
 pub(crate) fn business_ok(v: &Value) -> bool {
     let code = v.get("code").and_then(|c| c.as_i64());
     let success = v.get("success").and_then(|s| s.as_bool());
@@ -507,7 +508,7 @@ pub(crate) fn is_active_coding_plan_entry(s: &Value) -> bool {
         && s.get("status").and_then(|v| v.as_str()) == Some("VALID")
 }
 
-pub fn query_quota(tokens: &[String]) -> Result<QuotaOverview, String> {
+fn query_quota_via(tokens: &[String], fetch: &FetchFn) -> Result<QuotaOverview, String> {
     if tokens.is_empty() {
         return Err(crate::i18n::tr("err.quota.no_token"));
     }
@@ -515,7 +516,7 @@ pub fn query_quota(tokens: &[String]) -> Result<QuotaOverview, String> {
     let mut first_business: Option<String> = None;
     let mut auth_fail = 0usize;
     for t in tokens {
-        match query_with_token(t) {
+        match query_with_token_via(t, fetch) {
             Ok(ov) => return Ok(ov),
             Err(e) => {
                 if e.contains("401") {
@@ -528,10 +529,6 @@ pub fn query_quota(tokens: &[String]) -> Result<QuotaOverview, String> {
         }
     }
     if auth_fail > 0 && auth_fail == tokens.len() {
-        sleep(Duration::from_millis(1500));
-        if let Ok(ov) = query_with_token(&tokens[0]) {
-            return Ok(ov);
-        }
         return Err(crate::i18n::tr("err.token.expired"));
     }
     Err(first_business.or(last_err).unwrap_or_else(|| crate::i18n::tr("err.quota.fail")))
@@ -796,25 +793,109 @@ fn merge_parts(parts: Vec<QuotaOverview>) -> QuotaOverview {
     }
 }
 
-fn query_channels(channels: &[Channel]) -> Result<QuotaOverview, String> {
-    query_channels_via(channels, &|url, tok| http_get_json(url, tok, true))
+fn query_routes_via(channels: &[Channel], tokens: impl FnOnce() -> Vec<String>, fetch: &FetchFn) -> Result<QuotaOverview, String> {
+    use std::cell::{Cell, RefCell};
+    let saw_auth = Cell::new(false);
+    let may_fallback = Cell::new(true);
+    let responses: RefCell<std::collections::HashMap<(String, String), Result<Value, String>>> = RefCell::new(std::collections::HashMap::new());
+    let once = |url: &str, token: &str| {
+        let key = (url.to_string(), token.to_string());
+        if let Some(result) = responses.borrow().get(&key) { return result.clone(); }
+        let result = fetch(url, token);
+        match &result {
+            Ok(v) if matches!(v.get("code").and_then(|c| c.as_i64()), Some(401 | 1006)) => saw_auth.set(true),
+            Ok(v) if business_ok(v) => {},
+            _ => may_fallback.set(false),
+        }
+        responses.borrow_mut().insert(key, result.clone());
+        result
+    };
+    if !channels.is_empty() {
+        match query_channels_via(channels, &once) {
+            // An expired configured key may still have a valid saved OAuth/JWT.
+            // Network, rate-limit and other service errors never trigger this pass.
+            Err(_) if saw_auth.get() && may_fallback.get() => {},
+            result => return result,
+        }
+    }
+    query_quota_via(&tokens(), &once)
 }
 
 pub fn quota_for_live(home: &Path, creds: &Value, config: Option<&Value>) -> Result<QuotaOverview, String> {
     let secret = zcrypto::default_secret(home);
     let new_gen = crate::store::new_gen_provider_config(home);
     let channels = pick_channels(creds, config, &secret, new_gen);
-    if !channels.is_empty() {
-        if let Ok(ov) = query_channels(&channels) {
-            return Ok(ov);
-        }
-    }
-    let tokens = candidate_tokens(creds, config, &secret, new_gen);
-    query_quota(&tokens)
+    query_routes_via(&channels,
+        || candidate_tokens(creds, config, &secret, new_gen),
+        &|url, tok| http_get_json(url, tok, true))
 }
 
 pub fn quota_for_snapshot(home: &Path, creds: &Value, config: Option<&Value>) -> Result<QuotaOverview, String> {
     quota_for_live(home, creds, config)
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn known_route_error_does_not_spray_other_credentials_or_endpoints() {
+        let calls = RefCell::new(Vec::new());
+        let result = query_routes_via(&[Channel::ZaiBilling("known".into())],
+            || panic!("known route must not enumerate legacy credentials"),
+            &|url, token| {
+                calls.borrow_mut().push((url.to_string(), token.to_string()));
+                Err("connection timed out".into())
+            });
+        assert_eq!(result.unwrap_err(), "connection timed out");
+        assert_eq!(calls.borrow().len(), 1);
+        assert!(calls.borrow()[0].0.starts_with(BILLING_BALANCE_URL));
+        assert_eq!(calls.borrow()[0].1, "known");
+    }
+
+    #[test]
+    fn legacy_accounts_without_known_routes_still_query_quota() {
+        let calls = RefCell::new(Vec::new());
+        let result = query_routes_via(&[], || vec!["legacy".into()], &|url, token| {
+            calls.borrow_mut().push((url.to_string(), token.to_string()));
+            Ok(serde_json::json!({"code": 200, "data": {}}))
+        });
+        assert!(result.is_ok());
+        assert_eq!(calls.borrow()[0], (QUOTA_LIMIT_URL.to_string(), "legacy".to_string()));
+    }
+
+    #[test]
+    fn rejected_configured_key_can_use_valid_saved_credential_without_duplicate_requests() {
+        let calls = RefCell::new(Vec::new());
+        let result = query_routes_via(&[Channel::Monitor("stale".into())],
+            || vec!["stale".into(), "valid".into()], &|url, token| {
+                calls.borrow_mut().push((url.to_string(), token.to_string()));
+                if token == "stale" { Ok(serde_json::json!({"code":401})) }
+                else { Ok(serde_json::json!({"code":200,"data":{}})) }
+            });
+        assert!(result.is_ok());
+        assert_eq!(calls.borrow().iter().filter(|(url, token)| url == QUOTA_LIMIT_URL && token == "stale").count(), 1);
+        assert!(calls.borrow().iter().any(|(_, token)| token == "valid"));
+    }
+
+    #[test]
+    fn rate_limit_never_triggers_credential_fallback() {
+        let result = query_routes_via(&[Channel::Monitor("known".into())],
+            || panic!("rate limiting is not a stale credential"),
+            &|_, _| Ok(serde_json::json!({"code":3008,"message":"rate limited"})));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_failed_provider_does_not_discard_a_successful_other_provider() {
+        let result = query_routes_via(&[Channel::ZaiBilling("down".into()), Channel::Monitor("up".into())],
+            || panic!("no legacy fallback"), &|_, token| {
+                if token == "down" { Err("offline".into()) }
+                else { Ok(serde_json::json!({"code":200,"data":{}})) }
+            });
+        assert!(result.is_ok());
+    }
 }
 
 fn unit_label(unit: Option<i64>, number: Option<i64>) -> (String, String) {

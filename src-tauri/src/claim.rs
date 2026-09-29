@@ -4,7 +4,8 @@ use crate::zcrypto;
 use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub const BILLING_PREVIEW_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/preview";
 pub const BILLING_CLAIM_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim";
@@ -121,10 +122,11 @@ fn decrypt_credential(v: &str, secret: &str) -> Option<String> {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(CLAIM_TIMEOUT_SECS))
-        .build()
+        .build()).clone()
 }
 
 pub const EVENT_REPORT_URL: &str = "https://zcode.z.ai/api/v1/event/report";
@@ -185,10 +187,7 @@ fn device_os_category() -> &'static str {
 }
 
 pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(ACTIVATION_TIMEOUT_SECS))
-        .build();
+    let agent = agent();
     for element in ACTIVATION_EVENTS {
         let body = activation_event_body(
             element,
@@ -198,6 +197,7 @@ pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), S
         );
         let resp = agent
             .post(EVENT_REPORT_URL)
+            .timeout(Duration::from_secs(ACTIVATION_TIMEOUT_SECS))
             .set("Content-Type", "application/json")
             .send_json(body)
             .map_err(|e| {
@@ -312,19 +312,65 @@ pub fn submit_claim(
     Ok(v)
 }
 
+#[derive(Debug)]
+struct ConfigError {
+    message: String,
+    transient: bool,
+}
+
+impl ConfigError {
+    fn permanent(message: String) -> Self { Self { message, transient: false } }
+}
+
+#[derive(Default)]
+struct ConfigCache {
+    value: Option<(Instant, CaptchaConfig)>,
+}
+
+impl ConfigCache {
+    fn get(&mut self, mut fetch: impl FnMut() -> Result<CaptchaConfig, ConfigError>, mut pause: impl FnMut()) -> Result<CaptchaConfig, String> {
+        if let Some((at, cfg)) = &self.value {
+            if at.elapsed() < Duration::from_secs(300) { return Ok(cfg.clone()); }
+        }
+        self.value = None;
+        let cfg = match fetch() {
+            Err(e) if e.transient => { pause(); fetch().map_err(|e| e.message)? }
+            result => result.map_err(|e| e.message)?,
+        };
+        // Only successful, usable configuration is shared between accounts.
+        if cfg.enabled && !cfg.scene_id.trim().is_empty() {
+            self.value = Some((Instant::now(), cfg.clone()));
+        }
+        Ok(cfg)
+    }
+}
+
 pub fn fetch_captcha_config() -> Result<CaptchaConfig, String> {
-    let mut req = agent().get(CLIENT_CONFIGS_URL);
+    static CACHE: Mutex<ConfigCache> = Mutex::new(ConfigCache { value: None });
+    let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    cache.get(|| fetch_captcha_config_at(&agent(), CLIENT_CONFIGS_URL), || {
+        std::thread::sleep(Duration::from_millis(300));
+    })
+}
+
+fn fetch_captcha_config_at(agent: &ureq::Agent, url: &str) -> Result<CaptchaConfig, ConfigError> {
+    let mut req = agent.get(url).timeout(Duration::from_secs(12));
     for (k, v) in quota::zai_billing_headers("") {
         req = req.set(&k, &v);
     }
     let resp = req
         .call()
-        .map_err(|e| crate::i18n::trf("err.claim.config_req", &[("e", &e.to_string())]))?
+        .map_err(|e| ConfigError {
+            transient: matches!(&e, ureq::Error::Transport(t) if matches!(t.kind(),
+                ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns | ureq::ErrorKind::Io)),
+            message: http_err(&crate::i18n::tr("err.claim.config_unavailable"), e),
+        })?
         .into_string()
-        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
-    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+        .map_err(|e| ConfigError { transient: true, message: crate::i18n::trf("err.http.read", &[("e", &e.to_string())]) })?;
+    let v: Value = serde_json::from_str(&resp)
+        .map_err(|_| ConfigError::permanent(crate::i18n::tr("err.claim.config_unavailable")))?;
     if v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
-        return Err(crate::i18n::tr("err.claim.config_unavailable"));
+        return Err(ConfigError::permanent(crate::i18n::tr("err.claim.config_unavailable")));
     }
     let c = v.pointer("/data/configs/captcha").cloned().unwrap_or(Value::Null);
     let s = |k: &str| c.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
@@ -438,5 +484,85 @@ pub fn failure_message(code: i64, body: &Value) -> String {
         base
     } else {
         crate::i18n::trf("claim.fail.with_server", &[("base", &base), ("server_msg", &server_msg)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn config() -> CaptchaConfig {
+        CaptchaConfig { enabled: true, scene_id: "scene".into(), region: "sgp".into(), prefix: "prefix".into() }
+    }
+
+    #[test]
+    fn transient_config_error_retries_once_then_caches_success() {
+        let mut cache = ConfigCache::default();
+        let (mut calls, mut pauses) = (0, 0);
+        let result = cache.get(|| {
+            calls += 1;
+            if calls == 1 { Err(ConfigError { transient: true, message: "timeout".into() }) }
+            else { Ok(config()) }
+        }, || pauses += 1).unwrap();
+        assert_eq!(result.scene_id, "scene");
+        assert_eq!((calls, pauses), (2, 1));
+        cache.get(|| panic!("fresh cache must avoid HTTP"), || panic!()).unwrap();
+        cache.value.as_mut().unwrap().0 = Instant::now() - Duration::from_secs(301);
+        cache.get(|| { calls += 1; Ok(config()) }, || panic!()).unwrap();
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn failure_is_not_cached_and_retries_are_bounded() {
+        let mut cache = ConfigCache::default();
+        let mut calls = 0;
+        assert!(cache.get(|| {
+            calls += 1;
+            Err(ConfigError { transient: true, message: "offline".into() })
+        }, || {}).is_err());
+        assert_eq!(calls, 2);
+        assert!(cache.value.is_none());
+        cache.get(|| Ok(config()), || panic!()).unwrap();
+    }
+
+    #[test]
+    fn permanent_error_and_disabled_config_are_not_retried_or_cached() {
+        let mut cache = ConfigCache::default();
+        assert!(cache.get(|| Err(ConfigError::permanent("HTTP 401".into())), || panic!()).is_err());
+        let mut disabled = config(); disabled.enabled = false;
+        assert!(!cache.get(|| Ok(disabled.clone()), || panic!()).unwrap().enabled);
+        assert!(cache.value.is_none());
+        let mut missing_scene = config(); missing_scene.scene_id.clear();
+        cache.get(|| Ok(missing_scene.clone()), || panic!()).unwrap();
+        assert!(cache.value.is_none());
+    }
+
+    fn http_config(status: u16, body: &str) -> Result<CaptchaConfig, ConfigError> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/configs", listener.local_addr().unwrap());
+        let body = body.to_string();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = [0; 8192];
+            socket.read(&mut request).unwrap();
+            write!(socket, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let agent = ureq::AgentBuilder::new().try_proxy_from_env(false).build();
+        let result = fetch_captcha_config_at(&agent, &url);
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn real_http_config_path_parses_success_and_classifies_failures() {
+        let cfg = http_config(200, r#"{"code":0,"data":{"configs":{"captcha":{"enabled":true,"region":"sgp","prefix":"p","sceneId":"s"}}}}"#).unwrap();
+        assert_eq!(cfg.scene_id, "s");
+        for (status, body) in [(401, r#"{"msg":"unauthorized"}"#), (429, "{}"), (200, "not json"), (200, r#"{"code":3007}"#)] {
+            let err = http_config(status, body).unwrap_err();
+            assert!(!err.transient, "status {status} must not be retried");
+        }
     }
 }
