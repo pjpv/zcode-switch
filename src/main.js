@@ -138,6 +138,18 @@ function autoPillTitle(s) {
 }
 
 const actions = {
+  async toggleKeepalive() {
+    const enabled = !!state?.keepalive?.enabled;
+    const apply = async () => {
+      try { await invoke("set_keepalive", { enabled: !enabled }); await refresh(); render(); }
+      catch (e) { toast(stripErr(e), "err"); }
+    };
+    if (enabled) return apply();
+    openConfirmModal({
+      title: t("k.enableTitle"), desc: esc(t("k.enableDesc")),
+      yesLabel: t("k.enable"), onYes: apply,
+    });
+  },
   async refresh() { await refresh(); render(); },
 
   async capture() {
@@ -848,6 +860,9 @@ function render() {
         ${t("btn.autoClaim")}
       </button>
       <button class="btn-ghost has-ic" click="actions.addAccount()" title="${t("btn.addAccountTitle")}">${ic("userPlus", 16)} ${t("btn.addAccount")}</button>
+      ${s.keepalive?.supported ? `<button class="tog-inline${s.keepalive.enabled ? " on" : ""}" role="switch" aria-checked="${s.keepalive.enabled}" aria-label="${t("k.label")}" title="${esc(t("k.title"))}" click="actions.toggleKeepalive()">
+        <span class="toggle${s.keepalive.enabled ? " on" : ""}" aria-hidden="true"><span class="knob"></span></span>${t("k.label")}
+      </button>` : ""}
       ${s.zcode_running
         ? `<button class="btn-ghost has-ic" click="actions.askKill()" title="${t("btn.killZcode")}">${ic("power", 16)} ${t("btn.killZcode")}</button>`
         : `<button class="btn-ghost has-ic" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"}>${ic("play", 14)} ${t("btn.launchZcode")}</button>`}
@@ -855,6 +870,13 @@ function render() {
       <button class="btn-ghost tb-gear has-ic" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 16)}</button>
     </section>
 
+    ${s.keepalive?.supported && (s.keepalive.enabled || s.keepalive.reason) ? `<div class="keepalive-status" role="status">
+      <span>${esc(t(`k.phase.${s.keepalive.phase}`))}</span>
+      ${s.keepalive.pending ? `<span>${esc(t("k.pending", { n: s.keepalive.pending }))}</span>` : ""}
+      ${s.keepalive.recovered ? `<span>${esc(t("k.recovered", { n: s.keepalive.recovered }))}</span>` : ""}
+      ${s.keepalive.next_retry_at ? `<span>${esc(t("k.retry", { n: Math.max(0, Math.ceil((s.keepalive.next_retry_at - Date.now()) / 1000)) }))}</span>` : ""}
+      ${s.keepalive.reason ? `<span>${esc(t(`k.reason.${s.keepalive.reason}`))}</span>` : ""}
+    </div>` : ""}
     <div class="section-head">
       <h2>${t("m.accounts")}</h2>
       <span class="count">${t("m.count", { count: s.accounts.length })}</span>

@@ -142,6 +142,8 @@ pub struct Settings {
     pub language: Option<String>,
     #[serde(default)]
     pub auto_claim: Option<bool>,
+    #[serde(default)]
+    pub keepalive_enabled: Option<bool>,
 }
 
 impl Settings {
@@ -173,6 +175,7 @@ pub struct AccountSummary {
 
 #[derive(Serialize, Clone, Debug)]
 pub struct AppState {
+    pub keepalive: crate::keepalive::Status,
     pub zcode_running: bool,
     pub live_exists: bool,
     pub live_logged_in: bool,
@@ -1504,6 +1507,7 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         })
         .collect();
     Ok(AppState {
+        keepalive: crate::keepalive::status(),
         zcode_running: zcode_running(),
         live_exists: paths.live_file().exists(),
         live_logged_in,

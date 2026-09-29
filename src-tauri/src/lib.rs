@@ -8,6 +8,7 @@ mod probe;
 mod quota;
 mod store;
 mod zcrypto;
+mod keepalive;
 
 use serde_json::{json, Value};
 use std::sync::Mutex;
@@ -19,6 +20,11 @@ use tauri_plugin_autostart::AutoLaunchManager;
 use tauri_plugin_dialog::DialogExt;
 
 const TRAY_ID: &str = "main";
+
+#[tauri::command]
+async fn set_keepalive(enabled: bool) -> Result<keepalive::Status, String> {
+    keepalive::configure(enabled)
+}
 
 static STORE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -119,9 +125,16 @@ fn show_main(app: &AppHandle) {
 }
 
 fn run_tray_action(app: AppHandle, action: String) {
+    if action == "kill" || action == "launch" { keepalive::cancel_manual(); }
     std::thread::spawn(move || {
         let paths = Paths::detect();
         let mut emit_payload = json!({ "action": action });
+        if action == "kill" || action == "launch" {
+            if let Err(e) = keepalive::manual_action() {
+                let _ = app.emit("tray-action", json!({"action":action,"ok":false,"error":e}));
+                return;
+            }
+        }
         let _guard = store_guard();
         let result: Result<serde_json::Value, String> = match action.as_str() {
             "capture" => store::capture_current(&paths, None).map(|a| json!({ "name": a.name })),
@@ -195,6 +208,7 @@ async fn update_account_from_live(app: AppHandle, id: String) -> Result<Account,
 
 #[tauri::command]
 async fn switch_to(app: AppHandle, id: String, force: bool, restart: bool) -> Result<SwitchResult, String> {
+    keepalive::manual_action()?;
     let _guard = store_guard();
     let paths = Paths::detect();
     let hot = load_settings(&paths).hot_switch();
@@ -832,6 +846,7 @@ fn open_captcha_window(app: &AppHandle, auto: bool) -> Result<(), String> {
 
 #[tauri::command]
 async fn kill_zcode(app: AppHandle) -> Result<(), String> {
+    keepalive::manual_action()?;
     let _guard = store_guard();
     let r = if store::kill_zcode()? { Ok(()) } else { Err(i18n::tr("err.zcode.kill_timeout")) };
     rebuild_tray(&app);
@@ -1096,6 +1111,7 @@ async fn pick_zcode_path(app: AppHandle) -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 async fn set_zcode_path(app: AppHandle, path: String) -> Result<(), String> {
+    keepalive::manual_action()?;
     let _guard = store_guard();
     let paths = Paths::detect();
     let mut s = load_settings(&paths);
@@ -1108,6 +1124,7 @@ async fn set_zcode_path(app: AppHandle, path: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn launch_zcode(app: AppHandle) -> Result<(), String> {
+    keepalive::manual_action()?;
     let paths = Paths::detect();
     let (p, ok) = effective_zcode_path(&paths);
     if !ok {
@@ -1155,6 +1172,7 @@ pub fn run() {
             set_auth_proxy,
             kill_zcode,
             set_behavior,
+            set_keepalive,
             set_language,
             autostart_status,
             autostart_set,
@@ -1186,6 +1204,7 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            keepalive::start();
             i18n::init_from_settings(&store::load_settings(&Paths::detect()));
             if let Ok(data_dir) = app.path().app_local_data_dir() {
                 flowlog::init(&data_dir);

@@ -8,6 +8,8 @@ A Tauri 2 desktop tool for one-click switching between multiple ZCode accounts, 
 
 ## Features
 
+- **Windows keepalive (opt-in)**: recover newly detected CAPTCHA interruptions by restarting the same account and resuming captured conversations, with bounded retry frequency and execution-progress checks. [Behavior and compatibility](docs/keepalive.md#english)
+
 - **Save / switch accounts**: one-click login switching; the current login is auto-preserved before any switch — accounts are never lost
 - **Add accounts**: OAuth login for new accounts inside the tool (BigModel / z.ai entries), never touching the current login
 - **Quota display**: inline plan quota and reset time per account row, multi-plan grouping

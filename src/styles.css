@@ -184,6 +184,17 @@ input:focus-visible,
 }
 .led-text b { color: var(--ink); font-weight: 600; }
 
+.keepalive-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin: 10px 18px 0;
+  padding: 9px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  color: var(--ink-dim);
+  font-size: 12px;
+}
 .section-head {
   display: flex;
   align-items: baseline;
