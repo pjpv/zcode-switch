@@ -9,7 +9,9 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "dist": "node scripts/dist.mjs",
-    "check:i18n": "node scripts/check-i18n-keys.mjs"
+    "check:i18n": "node scripts/check-i18n-keys.mjs",
+    "test:login": "node scripts/test-login-session.mjs",
+    "test:claims": "node --test scripts/test-auto-claim-scheduler.mjs scripts/test-claim-result.mjs scripts/test-captcha-claim.mjs scripts/test-auto-controls.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1"

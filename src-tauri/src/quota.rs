@@ -53,24 +53,7 @@ pub(crate) const ZCODE_LANG: &str = "zh-CN";
 const ZCODE_CHANNEL: &str = "stable";
 
 pub(crate) fn device_mid() -> Option<String> {
-    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            let home = crate::store::pick_home(
-                std::env::var("ZCODE_SWITCH_HOME").ok().map(std::path::PathBuf::from),
-                std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from),
-                std::env::var("HOME").ok().map(std::path::PathBuf::from),
-            );
-            let p = crate::store::resolve_data_root(&home)
-                .join(".zcode")
-                .join("v2")
-                .join("telemetry-state.json");
-            std::fs::read_to_string(p)
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|v| v.get("deviceMid").and_then(|m| m.as_str()).map(String::from))
-        })
-        .clone()
+    crate::store::read_device_mid(&crate::store::Paths::detect())
 }
 
 #[cfg(windows)]

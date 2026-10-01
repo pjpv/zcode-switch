@@ -121,6 +121,7 @@ pub struct Account {
     pub credentials: Value,
     #[serde(default)]
     pub config: Option<Value>,
+    // Saved login context is used for claims, never written into the native client.
     #[serde(default)]
     pub virtual_device_mid: Option<String>,
     #[serde(default)]
@@ -587,7 +588,7 @@ pub fn capture_current(paths: &Paths, name: Option<String>) -> Result<Account, S
         }
     };
     let ts = now_ts();
-    let mut acc = Account {
+    let acc = Account {
         id: Uuid::new_v4().to_string(),
         name,
         created_at: ts.clone(),
@@ -595,11 +596,10 @@ pub fn capture_current(paths: &Paths, name: Option<String>) -> Result<Account, S
         hash,
         credentials: live,
         config,
-        virtual_device_mid: None,
+        virtual_device_mid: read_device_mid(paths),
         virtual_arms_uid: None,
     };
-    adopt_virtual_device_mid(paths, &mut acc)?;
-    adopt_virtual_arms_uid(paths, &mut acc)?;
+    save_account(paths, &acc)?;
     Ok(acc)
 }
 
@@ -630,7 +630,7 @@ fn auto_preserve(paths: &Paths, accounts: &[Account], target_hash: &str) -> Resu
     }
     let name = unique_name(accounts, &format!("Auto {}", Local::now().format("%m-%d %H%M")));
     let ts = now_ts();
-    let mut acc = Account {
+    let acc = Account {
         id: Uuid::new_v4().to_string(),
         name: name.clone(),
         created_at: ts.clone(),
@@ -638,11 +638,10 @@ fn auto_preserve(paths: &Paths, accounts: &[Account], target_hash: &str) -> Resu
         hash,
         credentials: live,
         config: snapshot_config_from_live(paths),
-        virtual_device_mid: None,
+        virtual_device_mid: read_device_mid(paths),
         virtual_arms_uid: None,
     };
-    adopt_virtual_device_mid(paths, &mut acc)?;
-    adopt_virtual_arms_uid(paths, &mut acc)?;
+    save_account(paths, &acc)?;
     Ok(Some(name))
 }
 
@@ -835,12 +834,6 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
                 eprintln!("sync-back 失败(不阻断 already 返回): {e}");
             }
         }
-        let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
-        write_live_device_mid(paths, &mid)?;
-        let uid = ensure_virtual_arms_uid_locked(paths, &target.id)?;
-        if !zcode_running() {
-            let _ = write_live_arms_uid(paths, &uid);
-        }
         return Ok(SwitchResult {
             switched: false,
             already_active: true,
@@ -854,6 +847,11 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         });
     }
 
+    // Match native cached-session restoration before closing the client or writing.
+    if account_jwt_expired(&target.credentials, &paths.home) {
+        return Err(tr("err.switch.jwt_expired"));
+    }
+
     let running = zcode_running();
     if hot && running {
         if let Err(e) = sync_live_back_to_source(paths, &accounts) {
@@ -865,10 +863,7 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         hot_swap_verified(paths, &target, &creds)?;
         backfill_relay_pass_hash(paths, &target.id, &creds);
         reset_live_plan_cache(paths);
-        let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
-        write_live_device_mid(paths, &mid)?;
-        ensure_virtual_arms_uid_locked(paths, &target.id)?;
-        let probe = run_switch_probe(paths, &target, Some(mid));
+        let probe = run_switch_probe(paths, &target, read_device_mid(paths));
         return Ok(SwitchResult {
             switched: true,
             already_active: false,
@@ -920,10 +915,6 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
     if !new_gen {
         rematerialize_wiped_builtins(paths, &target);
     }
-    let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
-    write_live_device_mid(paths, &mid)?;
-    let uid = ensure_virtual_arms_uid_locked(paths, &target.id)?;
-    let _ = write_live_arms_uid(paths, &uid);
 
     let mut launched = false;
     if restart {
@@ -933,7 +924,7 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         }
     }
 
-    let probe = run_switch_probe(paths, &target, Some(mid));
+    let probe = run_switch_probe(paths, &target, read_device_mid(paths));
 
     Ok(SwitchResult {
         switched: true,
@@ -1118,273 +1109,120 @@ pub fn account_quota(paths: &Paths, id: &str) -> Result<quota::QuotaOverview, St
     quota::quota_for_snapshot(&paths.home, &acc.credentials, acc.config.as_ref())
 }
 
-fn ensure_virtual_device_mid_locked(paths: &Paths, id: &str) -> Result<String, String> {
-    {
-        let acc = load_account(paths, id)?;
-        if let Some(m) = acc.virtual_device_mid.clone() {
-            if !m.trim().is_empty() {
-                return Ok(m);
-            }
-        }
-    }
-    let mut acc = load_account(paths, id)?;
-    if let Some(m) = acc.virtual_device_mid.clone() {
-        if !m.trim().is_empty() {
-            return Ok(m);
-        }
-    }
-    let m = Uuid::new_v4().to_string();
-    acc.virtual_device_mid = Some(m.clone());
-    acc.updated_at = now_ts();
-    save_account(paths, &acc)?;
-    Ok(m)
-}
-
-pub fn ensure_virtual_device_mid(paths: &Paths, id: &str) -> Result<String, String> {
-    if let Ok(acc) = load_account(paths, id) {
-        if let Some(m) = acc.virtual_device_mid.clone() {
-            if !m.trim().is_empty() {
-                return Ok(m);
-            }
-        }
-    }
-    let _guard = crate::store_guard();
-    ensure_virtual_device_mid_locked(paths, id)
-}
-
-pub fn write_live_device_mid(paths: &Paths, mid: &str) -> Result<(), String> {
-    let mut v: Value = fs::read_to_string(paths.live_telemetry())
+/// Device identity belongs to the ZCode installation, not the saved account.
+/// Never mint or write it here: the native client owns initialization and locking.
+pub fn read_device_mid(paths: &Paths) -> Option<String> {
+    fs::read_to_string(paths.live_telemetry())
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}));
-    if !v.is_object() {
-        v = json!({});
-    }
-    if v.get("deviceMid").and_then(|m| m.as_str()) == Some(mid) {
-        return Ok(());
-    }
-    v["deviceMid"] = json!(mid);
-    atomic_write(&paths.live_telemetry(), &(serde_json::to_string(&v).unwrap_or_default() + "\n"))
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.get("deviceMid").and_then(Value::as_str).map(str::to_string))
+        .filter(|mid| !mid.trim().is_empty())
 }
 
-fn adopt_virtual_device_mid(paths: &Paths, acc: &mut Account) -> Result<(), String> {
-    if acc.virtual_device_mid.as_deref().map_or(false, |m| !m.trim().is_empty()) {
-        return Ok(());
-    }
-    let live_mid: Option<String> = fs::read_to_string(paths.live_telemetry())
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v.get("deviceMid").and_then(|m| m.as_str()).map(String::from))
-        .filter(|m| !m.trim().is_empty());
-    let taken = |m: &str| {
-        list_accounts(paths)
-            .map(|accs| accs.iter().any(|a| a.virtual_device_mid.as_deref() == Some(m)))
-            .unwrap_or(false)
-    };
-    let mid = match live_mid {
-        Some(m) if !taken(&m) => m,
-        _ => Uuid::new_v4().to_string(),
-    };
-    acc.virtual_device_mid = Some(mid);
-    acc.updated_at = now_ts();
-    save_account(paths, acc)
+pub fn require_device_mid(paths: &Paths) -> Result<String, String> {
+    read_device_mid(paths).ok_or_else(|| tr("err.device.native_missing"))
 }
 
-const ARMS_DEFAULT_STORE_FILE: &str = "ZGVmYXVsdA.json";
-
-pub fn new_arms_uid() -> String {
-    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let uuid = Uuid::new_v4();
-    let suffix: String = uuid.as_bytes()
-        .iter()
-        .take(16)
-        .map(|b| ALPHABET[(*b as usize) % 36] as char)
-        .collect();
-    format!("uid_{suffix}")
-}
-
-fn arms_store_dirs_from(
-    win_appdata: Option<PathBuf>,
-    mac_appsupport: Option<PathBuf>,
-    unix_base: Option<PathBuf>,
-) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
-    let mut push_if_new = |dir: PathBuf| {
-        let lowered = dir.to_string_lossy().to_lowercase();
-        if !out.iter().any(|d| d.to_string_lossy().to_lowercase() == lowered) {
-            out.push(dir);
-        }
-    };
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    let groups: [(Option<PathBuf>, &[&str]); 3] = [
-        (win_appdata, &["ZCode", "zcode", "ZCode Preview", "ZCode Dev"]),
-        (mac_appsupport, &["ZCode", "zcode", "ZCode Preview", "ZCode Dev"]),
-        (unix_base, &["zcode", "ZCode"]),
-    ];
-    for (base, names) in groups {
-        let Some(base) = base else { continue };
-        for name in names {
-            candidates.push(base.join(name).join("rum-electron-store"));
-        }
-        if let Ok(rd) = fs::read_dir(&base) {
-            let extras: Vec<PathBuf> = rd
-                .flatten()
-                .filter(|e| {
-                    let n = e.file_name().to_string_lossy().to_lowercase();
-                    n.starts_with("zcode") && e.path().join("rum-electron-store").is_dir()
-                })
-                .map(|e| e.path().join("rum-electron-store"))
-                .collect();
-            candidates.extend(extras);
-        }
-    }
-    let existing: Vec<PathBuf> = candidates.iter().filter(|c| c.is_dir()).cloned().collect();
-    if existing.is_empty() {
-        candidates.truncate(1);
-        candidates
-    } else {
-        for c in existing {
-            push_if_new(c);
-        }
-        out
+/// Claim eligibility must retain the context used by this saved login. Old
+/// snapshots already carry it; native captures and OAuth store the actual MID.
+/// Reading this context must never generate an ID or alter the native client.
+pub fn account_claim_mid(paths: &Paths, account: &Account) -> Result<String, String> {
+    match account.virtual_device_mid.as_deref().map(str::trim).filter(|mid| !mid.is_empty()) {
+        Some(mid) => Ok(mid.to_string()),
+        None => require_device_mid(paths),
     }
 }
 
-fn arms_store_dirs_for(paths: &Paths) -> Vec<PathBuf> {
-    if in_sandbox() {
-        return vec![paths.home.join("arms-store-sandbox")];
-    }
-    #[cfg(windows)]
-    let (appdata, mac_base, unix_base) =
-        (std::env::var("APPDATA").ok().map(PathBuf::from), None, None);
-    #[cfg(target_os = "macos")]
-    let (appdata, mac_base, unix_base) = (
-        None,
-        std::env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(h).join("Library").join("Application Support")),
-        None,
-    );
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let (appdata, mac_base, unix_base) = (
-        None,
-        None,
-        std::env::var("XDG_CONFIG_HOME")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config"))),
-    );
-    arms_store_dirs_from(appdata, mac_base, unix_base)
-}
+#[cfg(test)]
+mod native_device_tests {
+    use super::*;
 
-fn ensure_virtual_arms_uid_locked(paths: &Paths, id: &str) -> Result<String, String> {
-    {
-        let acc = load_account(paths, id)?;
-        if let Some(u) = acc.virtual_arms_uid.clone() {
-            if !u.trim().is_empty() {
-                return Ok(u);
-            }
+    struct Fixture(Paths);
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("zsw-native-device-{}", Uuid::new_v4()));
+            Self(Paths { home: root.join("home"), data_root: root.join("data") })
         }
     }
-    let mut acc = load_account(paths, id)?;
-    if let Some(u) = acc.virtual_arms_uid.clone() {
-        if !u.trim().is_empty() {
-            return Ok(u);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.0.data_root.parent().unwrap());
         }
     }
-    let u = new_arms_uid();
-    acc.virtual_arms_uid = Some(u.clone());
-    acc.updated_at = now_ts();
-    save_account(paths, &acc)?;
-    Ok(u)
-}
 
-fn read_live_arms_uid_from(dirs: &[PathBuf]) -> Option<String> {
-    let read_uid = |f: &Path| -> Option<String> {
-        fs::read_to_string(f)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| v.get("_arms_uid").and_then(|u| u.as_str()).map(String::from))
-            .filter(|u| !u.trim().is_empty())
-    };
-    let mut files: Vec<PathBuf> = Vec::new();
-    for d in dirs {
-        if let Ok(rd) = fs::read_dir(d) {
-            let mut jsons: Vec<PathBuf> = rd
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
-                .collect();
-            jsons.sort_by_key(|p| !p.file_name().map(|n| n == ARMS_DEFAULT_STORE_FILE).unwrap_or(false));
-            files.extend(jsons);
+    #[test]
+    fn reads_current_native_identity_from_selected_data_root_without_caching() {
+        let fixture = Fixture::new();
+        let paths = &fixture.0;
+        fs::create_dir_all(paths.live_telemetry().parent().unwrap()).unwrap();
+        fs::write(paths.live_telemetry(), r#"{"deviceMid":"native-first"}"#).unwrap();
+        assert_eq!(require_device_mid(paths).unwrap(), "native-first");
+        fs::write(paths.live_telemetry(), r#"{"deviceMid":"native-current"}"#).unwrap();
+        assert_eq!(require_device_mid(paths).unwrap(), "native-current");
+        assert!(!paths.home.join(".zcode/v2/telemetry-state.json").exists());
+    }
+
+    #[test]
+    fn missing_or_invalid_native_state_is_never_replaced() {
+        let fixture = Fixture::new();
+        let paths = &fixture.0;
+        assert!(require_device_mid(paths).is_err());
+        assert!(!paths.live_telemetry().exists());
+        fs::create_dir_all(paths.live_telemetry().parent().unwrap()).unwrap();
+        for raw in ["broken-json", "{}", r#"{"deviceMid":"  "}"#] {
+            fs::write(paths.live_telemetry(), raw).unwrap();
+            assert!(require_device_mid(paths).is_err());
+            assert_eq!(fs::read_to_string(paths.live_telemetry()).unwrap(), raw);
         }
     }
-    files.iter().find_map(|f| read_uid(f))
-}
 
-pub fn write_live_arms_uid_to(dirs: &[PathBuf], uid: &str) -> Result<(), String> {
-    for d in dirs {
-        let mut jsons: Vec<PathBuf> = fs::read_dir(d)
-            .map(|rd| {
-                rd.flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if jsons.is_empty() {
-            fs::create_dir_all(d).map_err(|e| format!("mkdir {}: {e}", d.display()))?;
-            jsons.push(d.join(ARMS_DEFAULT_STORE_FILE));
-        }
-        let mut first_err: Option<String> = None;
-        for f in jsons {
-            let mut v: Value = fs::read_to_string(&f)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_else(|| json!({}));
-            if !v.is_object() {
-                v = json!({});
-            }
-            if v.get("_arms_uid").and_then(|u| u.as_str()) == Some(uid)
-                && v.get("_arms_session").is_none()
-            {
-                continue;
-            }
-            let obj = v.as_object_mut().unwrap();
-            obj.insert("_arms_uid".into(), json!(uid));
-            obj.remove("_arms_session");
-            if let Err(e) = atomic_write(&f, &(serde_json::to_string(&v).unwrap_or_default() + "\n")) {
-                first_err.get_or_insert(e);
-            }
-        }
-        if let Some(e) = first_err {
-            return Err(e);
-        }
+    #[test]
+    fn claim_context_preserves_saved_login_identity_without_touching_native_state() {
+        let fixture = Fixture::new();
+        let paths = &fixture.0;
+        fs::create_dir_all(paths.live_telemetry().parent().unwrap()).unwrap();
+        let raw = r#"{"deviceMid":"native-current","other":true}"#;
+        fs::write(paths.live_telemetry(), raw).unwrap();
+        let mut account = Account {
+            id: "account-a".into(), name: "A".into(), created_at: String::new(),
+            updated_at: String::new(), hash: String::new(), credentials: json!({}),
+            config: None, virtual_device_mid: Some("saved-login-mid".into()),
+            virtual_arms_uid: Some("saved-rum-uid".into()),
+        };
+        assert_eq!(account_claim_mid(paths, &account).unwrap(), "saved-login-mid");
+        assert_eq!(fs::read_to_string(paths.live_telemetry()).unwrap(), raw);
+        assert_eq!(require_device_mid(paths).unwrap(), "native-current");
+        account.virtual_device_mid = None;
+        assert_eq!(account_claim_mid(paths, &account).unwrap(), "native-current");
+        account.virtual_device_mid = Some("  ".into());
+        assert_eq!(account_claim_mid(paths, &account).unwrap(), "native-current");
+        fs::remove_file(paths.live_telemetry()).unwrap();
+        assert!(account_claim_mid(paths, &account).is_err());
+        account.virtual_device_mid = Some("saved-login-mid".into());
+        assert_eq!(account_claim_mid(paths, &account).unwrap(), "saved-login-mid");
+        assert!(!paths.live_telemetry().exists());
     }
-    Ok(())
-}
 
-fn write_live_arms_uid(paths: &Paths, uid: &str) -> Result<(), String> {
-    write_live_arms_uid_to(&arms_store_dirs_for(paths), uid)
-}
-
-fn adopt_virtual_arms_uid(paths: &Paths, acc: &mut Account) -> Result<(), String> {
-    if acc.virtual_arms_uid.as_deref().is_some_and(|u| !u.trim().is_empty()) {
-        return Ok(());
+    #[test]
+    fn account_bundle_round_trip_preserves_credentials_and_claim_context() {
+        let fixture = Fixture::new();
+        let paths = &fixture.0;
+        let account = Account {
+            id: "account-a".into(), name: "A".into(), created_at: String::new(),
+            updated_at: String::new(), hash: String::new(),
+            credentials: json!({"zcodejwttoken":"test-token", "opaque":"keep"}),
+            config: None, virtual_device_mid: Some("saved-login-mid".into()),
+            virtual_arms_uid: None,
+        };
+        let bundle = export_bundle_value(&[account.clone()]);
+        let report = import_values(paths, &[("test.zsb".into(), bundle)]).unwrap();
+        assert!(report.errors.is_empty());
+        let restored = list_accounts(paths).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].credentials, account.credentials);
+        assert_eq!(account_claim_mid(paths, &restored[0]).unwrap(), "saved-login-mid");
+        assert!(!paths.live_telemetry().exists());
     }
-    let live_uid = read_live_arms_uid_from(&arms_store_dirs_for(paths));
-    let taken = |u: &str| {
-        list_accounts(paths)
-            .map(|accs| accs.iter().any(|a| a.virtual_arms_uid.as_deref() == Some(u)))
-            .unwrap_or(false)
-    };
-    let uid = match live_uid {
-        Some(u) if !taken(&u) => u,
-        _ => new_arms_uid(),
-    };
-    acc.virtual_arms_uid = Some(uid);
-    acc.updated_at = now_ts();
-    save_account(paths, acc)
 }
 
 pub fn export_bundle_value(accounts: &[Account]) -> Value {
@@ -1397,11 +1235,12 @@ pub fn export_bundle_value(accounts: &[Account]) -> Value {
             "createdAt": a.created_at,
             "credentials": a.credentials,
             "config": a.config,
+            "claimDeviceMid": a.virtual_device_mid,
         })).collect::<Vec<_>>(),
     })
 }
 
-type ImportCandidate = (Option<String>, Value, Option<Value>);
+type ImportCandidate = (Option<String>, Value, Option<Value>, Option<String>);
 
 fn import_candidates(v: &Value) -> Result<Vec<ImportCandidate>, String> {
     if v.get("format").and_then(|f| f.as_str()) == Some("zcode-accounts-bundle") {
@@ -1416,6 +1255,8 @@ fn import_candidates(v: &Value) -> Result<Vec<ImportCandidate>, String> {
                 item.get("name").and_then(|n| n.as_str()).map(String::from),
                 creds,
                 item.get("config").cloned(),
+                item.get("claimDeviceMid").and_then(Value::as_str)
+                    .map(str::trim).filter(|mid| !mid.is_empty()).map(str::to_string),
             ));
         }
         return Ok(out);
@@ -1437,7 +1278,7 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
                 continue;
             }
         };
-        for (name_opt, creds, config_opt) in cands {
+        for (name_opt, creds, config_opt, claim_mid) in cands {
             if !is_logged_in(&creds) {
                 report.skipped.push(trf("err.import.no_creds", &[("fname", fname.as_str())]));
                 continue;
@@ -1461,7 +1302,7 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
                 hash,
                 credentials: creds,
                 config: config_opt,
-                virtual_device_mid: None,
+                virtual_device_mid: claim_mid,
                 virtual_arms_uid: None,
             };
             new_accounts.push(acc);
