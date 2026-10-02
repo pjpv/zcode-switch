@@ -328,11 +328,29 @@ pub fn zcode_running() -> bool {
         return false;
     }
     ["zcode", "ZCode"].iter().any(|name| {
-        no_window("pgrep")
-            .args(["-x", name])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        let out = match no_window("pgrep").args(["-x", name]).output() {
+            Ok(o) => o,
+            Err(_) => return false,
+        };
+        if !out.status.success() {
+            return false;
+        }
+        // pgrep 会把僵尸进程也算匹配上；我们 spawn 的 ZCode 退出后若尚未回收
+        // 就是僵尸，必须按进程状态排除，否则强制切换的 kill 会误判超时。
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .any(|pid| {
+                no_window("ps")
+                    .args(["-o", "state=", "-p", pid])
+                    .output()
+                    .ok()
+                    .map(|o| {
+                        let st = String::from_utf8_lossy(&o.stdout);
+                        let st = st.trim();
+                        !st.is_empty() && !st.starts_with('Z')
+                    })
+                    .unwrap_or(false)
+            })
     })
 }
 
@@ -398,9 +416,13 @@ pub fn launch_zcode(path: &str) -> Result<(), String> {
     if !p.exists() {
         return Err(trf("err.zcode.missing", &[("path", path)]));
     }
-    detached(Command::new(&p))
+    let mut child = detached(Command::new(&p))
         .spawn()
         .map_err(|e| trf("err.zcode.launch", &[("e", &e.to_string())]))?;
+    // 后台回收，避免 ZCode 退出后残留僵尸进程（详见 zcode_running 注释）。
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
