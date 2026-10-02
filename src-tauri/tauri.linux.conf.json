@@ -1,0 +1,17 @@
+{
+  "app": {
+    "windows": [
+      {
+        "title": "Z·SWITCH",
+        "width": 680,
+        "height": 820,
+        "minWidth": 520,
+        "minHeight": 640,
+        "resizable": true,
+        "center": true,
+        "theme": "Dark",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server"
+      }
+    ]
+  }
+}

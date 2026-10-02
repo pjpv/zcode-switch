@@ -806,15 +806,22 @@ fn open_captcha_window(app: &AppHandle, auto: bool) -> Result<(), String> {
         }
         return Ok(());
     }
-    let win = tauri::WebviewWindowBuilder::new(
+    // Linux: window background_color 会让 WebKitGTK(2.5x) 整个 webview 不渲染（黑屏），
+    // 前端页面自带深色背景，这里仅在非 Linux 平台设置以避免启动白闪。
+    #[allow(unused_mut)]
+    let mut builder = tauri::WebviewWindowBuilder::new(
         app,
         "captcha",
         tauri::WebviewUrl::App("captcha.html".into()),
     )
     .title(i18n::tr("title.captcha"))
-    .theme(Some(tauri::Theme::Dark))
-    .background_color(tauri::window::Color(10, 10, 12, 255))
-    .inner_size(w, h)
+    .theme(Some(tauri::Theme::Dark));
+    #[cfg(not(target_os = "linux"))]
+    {
+        builder = builder.background_color(tauri::window::Color(10, 10, 12, 255));
+    }
+    let win = builder
+        .inner_size(w, h)
     .min_inner_size(340.0, 280.0)
     .maximizable(false)
     .resizable(false)
@@ -907,15 +914,20 @@ async fn open_settings(app: AppHandle) -> Result<(), String> {
         let _ = win.set_focus();
         return Ok(());
     }
-    let win = tauri::WebviewWindowBuilder::new(
+    #[allow(unused_mut)]
+    let mut builder = tauri::WebviewWindowBuilder::new(
         &app,
         "settings",
         tauri::WebviewUrl::App("settings.html".into()),
     )
     .title(i18n::tr("title.settings"))
-    .theme(Some(tauri::Theme::Dark))
-    .background_color(tauri::window::Color(10, 10, 12, 255))
-    .inner_size(w, h)
+    .theme(Some(tauri::Theme::Dark));
+    #[cfg(not(target_os = "linux"))]
+    {
+        builder = builder.background_color(tauri::window::Color(10, 10, 12, 255));
+    }
+    let win = builder
+        .inner_size(w, h)
     .min_inner_size(440.0, 540.0)
     .resizable(true)
     .additional_browser_args("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server")

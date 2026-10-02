@@ -35,7 +35,22 @@ fn ensure_cli_console() {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn linux_webkit_workaround() {
+    // WebKitGTK 的 DMABUF 渲染器在 Wayland 下会触发 Gdk Error 71（protocol
+    // error）直接崩溃，NVIDIA 驱动上必现。回退到旧渲染路径。
+    let on_wayland = match std::env::var("WAYLAND_DISPLAY") {
+        Ok(v) => !v.trim().is_empty(),
+        Err(_) => std::env::var("XDG_SESSION_TYPE").map(|v| v.trim() == "wayland").unwrap_or(false),
+    };
+    if on_wayland && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+}
+
 fn main() {
+    #[cfg(target_os = "linux")]
+    linux_webkit_workaround();
     let args: Vec<String> = std::env::args().collect();
     if let Some(pos) = args.iter().position(|a| a == "--cli") {
         let cli_args: Vec<String> = args.iter().skip(pos + 1).cloned().collect();
