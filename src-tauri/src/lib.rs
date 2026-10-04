@@ -1082,11 +1082,10 @@ async fn import_sealed(app: AppHandle, files: Vec<(String, Value)>, password: St
 
 #[tauri::command]
 async fn pick_zcode_path(app: AppHandle) -> Result<serde_json::Value, String> {
-    let picked = app
-        .dialog()
-        .file()
-        .add_filter(&i18n::tr("dialog.exe"), &["exe"])
-        .blocking_pick_file();
+    let dialog = app.dialog().file();
+    #[cfg(windows)]
+    let dialog = dialog.add_filter(&i18n::tr("dialog.exe"), &["exe"]);
+    let picked = dialog.blocking_pick_file();
     let Some(fp) = picked else {
         return Ok(json!({ "picked": false }));
     };

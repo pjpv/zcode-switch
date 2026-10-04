@@ -645,8 +645,10 @@ function claimStripHtml(id) {
   </div>`;
 }
 
-function slotRowsHtml(items) {
-  const list = items || [];
+function slotRowsHtml(items, tierCode) {
+  const list = (items || []).filter((it) => !(
+    tierCode === "lite" && itemKind(it) === "duration" && it.window === "monthly"
+  ));
   const isWin = (it) => itemKind(it) !== "raw";
   const wins = list.filter(isWin);
   const best = new Map();
@@ -682,7 +684,7 @@ function planGroupHtml(p) {
       <span class="pg-name" title="${esc(label)}">${esc(label)}</span>
       ${exp ? `<span class="pg-exp${exp.warn ? " warn-line" : ""}" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntilShort", { date: exp.text }))}</span>` : ""}
     </div>
-    ${slotRowsHtml(p.items)}
+    ${slotRowsHtml(p.items, p.tier_code)}
   </div>`;
 }
 
@@ -705,7 +707,7 @@ function acctQuotaSlot(id) {
       if (wins.length) {
         inner = wins.map((it) => winRowHtml(it, " mini")).join("");
       } else {
-        inner = slotRowsHtml(items);
+        inner = slotRowsHtml(items, plans[0]?.tier_code);
       }
     }
   }

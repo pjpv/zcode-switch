@@ -31,3 +31,4 @@ nul
 .zcode/
 
 __pycache__/
+.tmp/

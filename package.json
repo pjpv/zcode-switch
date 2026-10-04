@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "tauri": "tauri",
+    "tauri": "node scripts/tauri.mjs",
     "dist": "node scripts/dist.mjs",
     "check:i18n": "node scripts/check-i18n-keys.mjs"
   },

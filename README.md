@@ -52,13 +52,20 @@ CLI 密码（export / import）：优先环境变量 `ZSW_PASSWORD`（不出现�
 
 ## 构建
 
+先安装 Node.js 和 Rust 工具链（需要 `cargo`、`rustc`）。macOS 还需要 Xcode Command Line Tools，使用 `xcode-select --install` 安装。
+
+若出现 `cargo metadata ... No such file or directory`，说明 Cargo 未安装或不在 PATH。按 [Rust 官方安装说明](https://rust-lang.org/tools/install/) 安装后，执行 `source "$HOME/.cargo/env"`，再用 `cargo --version` 检查。
+
 ```bash
 npm install
 npm run tauri dev      # 开发（HMR）
-npm run tauri build    # NSIS 安装包
+npm run tauri build    # macOS：APP + DMG；Windows：NSIS
+npm run dist           # 将 macOS DMG 或 Windows 安装包、便携版复制到 release/
 ```
 
-Windows 优先（路径探测 / 进程管理 / 托盘均为 Win32 语义）。
+macOS 构建产物在 `src-tauri/target/release/bundle/macos/` 和 `src-tauri/target/release/bundle/dmg/`。Intel Mac 构建 x64 版本，Apple 芯片 Mac 构建 ARM64 版本。使用前需安装 ZCode；默认探测系统或用户 Applications 目录，也可以在设置中填写 `.app` 或其内部可执行文件路径。
+
+项目构建入口会识别用户目录下的 Cargo；Mac 打包自动跳过 Finder 窗口美化脚本，避免依赖 Finder 自动化权限。
 
 ## License
 

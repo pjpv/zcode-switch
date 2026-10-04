@@ -29,6 +29,22 @@ try {
   fail("构建失败（若是 os error 32：旧实例还在托盘驻留锁住了 exe，退出后重试）");
 }
 
+if (process.platform === "darwin") {
+  const bundleDir = join(root, "src-tauri/target/release/bundle/dmg");
+  if (!existsSync(bundleDir)) fail(`找不到打包目录：${bundleDir}`);
+  const packages = readdirSync(bundleDir).filter((f) => f.endsWith(".dmg") && f.includes(`_${ver}_`));
+  if (!packages.length) fail(`没有当前版本 ${ver} 的 DMG 安装包`);
+  const outDir = join(root, "release");
+  mkdirSync(outDir, { recursive: true });
+  for (const name of packages) {
+    const destination = join(outDir, name);
+    copyFileSync(join(bundleDir, name), destination);
+    console.log(`[dist] ✓ 安装包  ${name}  (${mb(destination)} MB)`);
+  }
+  console.log(`[dist] 完成 → ${outDir}`);
+  process.exit(0);
+}
+
 const bundleDir = join(root, "src-tauri/target/release/bundle/nsis");
 if (!existsSync(bundleDir)) fail(`找不到打包目录：${bundleDir}`);
 const setups = readdirSync(bundleDir)

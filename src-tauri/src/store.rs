@@ -480,11 +480,32 @@ pub fn normalize_zcode_path(raw: &str) -> Option<String> {
             t = t[1..t.len() - 1].trim();
         }
     }
-    (!t.is_empty()).then(|| t.to_string())
+    if t.is_empty() {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    if t.ends_with(".app") {
+        return Some(PathBuf::from(t).join("Contents/MacOS/ZCode").to_string_lossy().into_owned());
+    }
+    Some(t.to_string())
 }
 
 pub fn effective_zcode_path(paths: &Paths) -> (String, bool) {
     effective_zcode_path_in(paths, &client_path_candidates(std::env::consts::OS))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_path_tests {
+    use super::normalize_zcode_path;
+
+    #[test]
+    fn accepts_app_bundles_and_executables() {
+        let executable = "/Applications/ZCode.app/Contents/MacOS/ZCode";
+        assert_eq!(normalize_zcode_path("  \"/Applications/ZCode.app\"  "), Some(executable.into()));
+        assert_eq!(normalize_zcode_path(executable), Some(executable.into()));
+        assert_eq!(normalize_zcode_path("  "), None);
+        assert_eq!(normalize_zcode_path("\"\""), None);
+    }
 }
 
 fn effective_zcode_path_in(paths: &Paths, candidates: &[String]) -> (String, bool) {

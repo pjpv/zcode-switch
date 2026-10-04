@@ -52,13 +52,18 @@ The embedded pages (such as the login page) are rendered by the system WebView, 
 
 ## Build
 
+Install Node.js and the Rust toolchain (`cargo` and `rustc`) first. macOS also needs Xcode Command Line Tools (`xcode-select --install`). If Cargo is missing, follow the [official Rust installation guide](https://rust-lang.org/tools/install/), run `source "$HOME/.cargo/env"`, and check `cargo --version`.
+
 ```bash
 npm install
 npm run tauri dev      # development (HMR)
-npm run tauri build    # NSIS installer
+npm run tauri build    # macOS: APP + DMG; Windows: NSIS
+npm run dist           # copy installers into release/
 ```
 
-Windows-first (path detection / process management / tray are all Win32 semantics).
+macOS artifacts are under `src-tauri/target/release/bundle/macos/` and `src-tauri/target/release/bundle/dmg/`. Builds use the host architecture. Install ZCode before use; the app detects standard Applications locations, and settings accept either a `.app` path or its internal executable.
+
+The project CLI detects Cargo in the user directory. Mac packaging skips Finder window customization to avoid depending on Finder automation permissions.
 
 ## License
 
