@@ -415,6 +415,40 @@ const actions = {
     toast(t("m.refreshClaimDone", { n: ids.length, k: okCount }), "ok");
   },
 
+  async refreshClaimOne(id) {
+    const now = Date.now();
+    if (refreshClaim.running || claimAllRunning || claimActive) {
+      toast(t("m.claimBusy"), "warn");
+      return;
+    }
+    if (now < refreshClaim.cooldownUntil) {
+      toast(t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - now) / 1000) }), "warn");
+      return;
+    }
+    const name = state?.accounts.find((a) => a.id === id)?.name || id;
+    refreshClaim = { running: true, done: 0, total: 1, cooldownUntil: 0 };
+    let hasPlans = false;
+    try {
+      claimable[id] = { plans: claimable[id]?.plans || [], busy: true };
+      if (!uiLocked()) render();
+      try {
+        const r = await invoke("claim_refresh", { id });
+        claimable[id] = { plans: r.plans || [], err: null, busy: false };
+        hasPlans = (r.plans || []).length > 0;
+        if (r.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(r.activationError) }), "warn");
+      } catch (e) {
+        claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
+        toast(t("m.refreshClaimAcctErr", { name, err: stripErr(e) }), "err");
+      }
+      scheduleNext(id);
+    } finally {
+      refreshClaim.running = false;
+      refreshClaim.cooldownUntil = Date.now() + REFRESH_CLAIM_COOLDOWN_MS;
+      if (!uiLocked()) render();
+    }
+    toast(hasPlans ? t("m.refreshClaimOneOk", { name }) : t("m.refreshClaimOneNone", { name }), "ok");
+  },
+
   async toggleAutoClaim() {
     if (autoToggleBusy) return;
     const next = !state.auto_claim;
@@ -754,6 +788,13 @@ function render() {
       ? unsaved ? t("m.status.unsaved") : t("m.status.safe")
       : t("m.status.loggedOut");
 
+  const rOneCooling = Date.now() < refreshClaim.cooldownUntil;
+  const rOneBusy = refreshClaim.running && refreshClaim.total === 1;
+  const rOneDisabled = refreshClaim.running || claimAllRunning || claimActive || autoClaimRunning || rOneCooling;
+  const rOneTitle = refreshClaim.running || !rOneCooling
+    ? t("btn.refreshClaimOneTitle")
+    : t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - Date.now()) / 1000) });
+
   const rows = s.accounts.map((a) => {
     const isActive = a.is_active;
     if (renaming === a.id) {      return `
@@ -788,6 +829,7 @@ function render() {
           <div class="row-meta">${meta}</div>
         </div>
         <div class="row-actions">
+          <button class="icon-btn${rOneBusy ? " spinning" : ""}" title="${esc(rOneTitle)}" aria-label="${t("btn.refreshClaim")}" click="actions.refreshClaimOne('${a.id}')" ${rOneDisabled ? "disabled" : ""}>${ic("refresh", 16)}</button>
           <button class="icon-btn" title="${t("btn.quota")}" aria-label="${t("btn.quota")}" click="actions.acctQuota('${a.id}')">${ic("gauge", 16)}</button>
           <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 16)}</button>
           <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 16)}</button>
@@ -835,7 +877,7 @@ function render() {
             title="${Date.now() < refreshClaim.cooldownUntil && !refreshClaim.running
               ? esc(t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - Date.now()) / 1000) }))
               : esc(t("btn.refreshClaimTitle"))}">
-            ${ic("refresh", 16)} ${refreshClaim.running
+            ${ic("refresh", 16)} ${refreshClaim.running && refreshClaim.total > 1
               ? esc(t("btn.refreshClaimRunning", { done: refreshClaim.done, total: refreshClaim.total }))
               : esc(t("btn.refreshClaim"))}
           </button>`
