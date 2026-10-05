@@ -312,6 +312,9 @@ input:focus-visible,
 }
 .icon-btn:hover { color: var(--ink); border-color: var(--hairline); background: var(--panel-2); }
 .icon-btn.danger:hover { color: var(--red); border-color: var(--red-dim); background: rgba(224, 82, 82, .08); }
+.icon-btn.spinning { color: var(--ink); }
+.icon-btn.spinning .ic { animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 
 .btn-switch {
   border: 1px solid var(--amber-deep);
