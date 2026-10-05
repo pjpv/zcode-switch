@@ -1171,20 +1171,7 @@ fn adopt_virtual_device_mid(paths: &Paths, acc: &mut Account) -> Result<(), Stri
     if acc.virtual_device_mid.as_deref().map_or(false, |m| !m.trim().is_empty()) {
         return Ok(());
     }
-    let live_mid: Option<String> = fs::read_to_string(paths.live_telemetry())
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v.get("deviceMid").and_then(|m| m.as_str()).map(String::from))
-        .filter(|m| !m.trim().is_empty());
-    let taken = |m: &str| {
-        list_accounts(paths)
-            .map(|accs| accs.iter().any(|a| a.virtual_device_mid.as_deref() == Some(m)))
-            .unwrap_or(false)
-    };
-    let mid = match live_mid {
-        Some(m) if !taken(&m) => m,
-        _ => Uuid::new_v4().to_string(),
-    };
+    let mid = Uuid::new_v4().to_string();
     acc.virtual_device_mid = Some(mid);
     acc.updated_at = now_ts();
     save_account(paths, acc)

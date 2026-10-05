@@ -20,7 +20,7 @@ fn no_window(prog: &str) -> std::process::Command {
 pub const QUOTA_LIMIT_URL: &str = "https://open.bigmodel.cn/api/monitor/usage/quota/limit";
 pub const SUBSCRIPTION_URL: &str = "https://open.bigmodel.cn/api/biz/subscription/list";
 pub const BILLING_BALANCE_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance";
-pub const CLIENT_APP_VERSION: &str = "3.11.2";
+pub const CLIENT_APP_VERSION: &str = "3.14.4";
 
 pub(crate) fn client_platform() -> String {
     let os = crate::zcrypto::node_platform_for(std::env::consts::OS);
@@ -129,45 +129,81 @@ pub(crate) fn client_timezone() -> String {
     iana_time_zone::get_timezone().unwrap_or_else(|_| "unknown".to_string())
 }
 
+#[cfg(windows)]
+fn detect_installed_version() -> Option<String> {
+    for hive in [
+        r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+    ] {
+        let Ok(out) = no_window("reg").args(["query", hive, "/s"]).output() else {
+            continue;
+        };
+        let txt = String::from_utf8_lossy(&out.stdout);
+        let (mut name, mut ver) = (String::new(), String::new());
+        for line in txt.lines() {
+            let l = line.trim();
+            if l.starts_with("HKEY_") {
+                if is_zcode_display_name(&name) && !ver.is_empty() {
+                    return Some(normalize_version(&ver));
+                }
+                name.clear();
+                ver.clear();
+                continue;
+            }
+            if let Some(rest) = l.strip_prefix("DisplayName") {
+                name = rest.trim_start().trim_start_matches("REG_SZ").trim().to_string();
+            } else if let Some(rest) = l.strip_prefix("DisplayVersion") {
+                ver = rest.trim_start().trim_start_matches("REG_SZ").trim().to_string();
+            }
+        }
+        if is_zcode_display_name(&name) && !ver.is_empty() {
+            return Some(normalize_version(&ver));
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn detect_installed_version() -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        std::path::PathBuf::from("/Applications/ZCode.app/Contents/Info.plist"),
+        std::path::PathBuf::from(format!("{home}/Applications/ZCode.app/Contents/Info.plist")),
+    ];
+    for p in candidates {
+        if let Ok(content) = std::fs::read_to_string(&p) {
+            if let Some(pos) = content.find("<key>CFBundleShortVersionString</key>") {
+                let rest = &content[pos..];
+                if let (Some(s), Some(e)) = (rest.find("<string>"), rest.find("</string>")) {
+                    if s + 8 < e {
+                        let ver = rest[s + 8..e].trim();
+                        if !ver.is_empty() {
+                            return Some(normalize_version(ver));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn detect_installed_version() -> Option<String> {
+    None
+}
+
 pub(crate) fn zcode_app_version() -> String {
     static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
-            for hive in [
-                r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-                r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
-                r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-            ] {
-                let Ok(out) = no_window("reg").args(["query", hive, "/s"]).output() else {
-                    continue;
-                };
-                let txt = String::from_utf8_lossy(&out.stdout);
-                let (mut name, mut ver) = (String::new(), String::new());
-                for line in txt.lines() {
-                    let l = line.trim();
-                    if l.starts_with("HKEY_") {
-                        if is_zcode_display_name(&name) && !ver.is_empty() {
-                            return normalize_version(&ver);
-                        }
-                        name.clear();
-                        ver.clear();
-                        continue;
-                    }
-                    if let Some(rest) = l.strip_prefix("DisplayName") {
-                        name = rest.trim_start().trim_start_matches("REG_SZ").trim().to_string();
-                    } else if let Some(rest) = l.strip_prefix("DisplayVersion") {
-                        ver = rest.trim_start().trim_start_matches("REG_SZ").trim().to_string();
-                    }
-                }
-                if is_zcode_display_name(&name) && !ver.is_empty() {
-                    return normalize_version(&ver);
-                }
-            }
-            CLIENT_APP_VERSION.to_string()
+            detect_installed_version().unwrap_or_else(|| CLIENT_APP_VERSION.to_string())
         })
         .clone()
 }
 
+#[cfg(windows)]
 fn is_zcode_display_name(name: &str) -> bool {
     let l = name.to_lowercase();
     l.contains("zcode") && !l.contains("switch")
@@ -193,7 +229,7 @@ pub(crate) fn zai_billing_headers_with_mid(token: &str, mid: Option<String>) -> 
 pub(crate) struct OAuthFlowHeaders(pub Vec<(String, String)>);
 
 pub(crate) fn zai_oauth_headers_with_mid(token: &str, mid: Option<String>) -> OAuthFlowHeaders {
-    OAuthFlowHeaders(zai_headers_with_version(CLIENT_APP_VERSION.to_string(), token, mid))
+    OAuthFlowHeaders(zai_headers_with_version(zcode_app_version(), token, mid))
 }
 
 fn zai_headers_with_version(ver: String, token: &str, mid: Option<String>) -> Vec<(String, String)> {
@@ -617,6 +653,9 @@ pub(crate) fn pick_channels(creds: &Value, config: Option<&Value>, secret: &str,
         (!k.starts_with("enc:") && looks_like_token(k)).then(|| k.to_string())
     };
     for (id, p) in ordered {
+        if p.get("enabled").and_then(|e| e.as_bool()) == Some(false) {
+            continue;
+        }
         let key = provider_key(p);
         if id.contains("start-plan") {
             let jwt = safe_decrypt(
@@ -751,11 +790,14 @@ fn merge_parts(parts: Vec<QuotaOverview>) -> QuotaOverview {
         }
         refreshed = refreshed.max(p.refreshed_at);
         for s in &p.plans {
-            let dup = slot_src.iter().enumerate().any(|(i, src)| {
-                src != &p.source
-                    && slots[i].tier == s.tier
-                    && slots[i].name == s.name
-                    && !slots[i].items.is_empty()
+            let dup = slots.iter().any(|existing| {
+                if !s.pid.is_empty() && existing.pid == s.pid {
+                    return true;
+                }
+                existing.tier == s.tier
+                    && existing.name == s.name
+                    && existing.expire == s.expire
+                    && !existing.items.is_empty()
                     && !s.items.is_empty()
             });
             if !dup {
