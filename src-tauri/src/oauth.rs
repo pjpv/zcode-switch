@@ -198,15 +198,21 @@ pub enum CallbackKind {
 }
 
 pub fn parse_callback(url: &str) -> Result<CallbackKind, String> {
-    let rest = url
-        .strip_prefix("zcode://oauth/callback")
-        .ok_or_else(|| crate::i18n::tr("err.oauth.not_callback"))?;
-    let qs = rest.trim_start_matches('?');
+    let s = url.trim();
+    let qs = if let Some(rest) = s.strip_prefix("zcode://oauth/callback") {
+        rest.trim_start_matches('?')
+    } else if let Some(idx) = s.find('?') {
+        &s[idx + 1..]
+    } else if s.contains("code=") || s.contains("authCode=") {
+        s
+    } else {
+        return Err(crate::i18n::tr("err.oauth.not_callback"));
+    };
     let mut code = String::new();
     let mut state = String::new();
     let mut has_attribution = false;
     for kv in qs.split('&') {
-        let (k, v) = kv.split_once('=').ok_or_else(|| crate::i18n::tr("err.oauth.bad_cb"))?;
+        let Some((k, v)) = kv.split_once('=') else { continue };
         match urldecode(k).as_str() {
             "authCode" => code = urldecode(v),
             "code" if code.is_empty() => code = urldecode(v),
@@ -483,8 +489,8 @@ pub fn extract_access_token(provider: &str, raw: &Value) -> Option<String> {
     };
     let data = raw.get("data")?;
     match provider {
-        "bigmodel" => data.get("bigmodel").and_then(&pick).or_else(|| pick(data)),
-        "zai" => data.get("zai").and_then(&pick),
+        "bigmodel" => data.get("bigmodel").and_then(pick).or_else(|| pick(data)),
+        "zai" => data.get("zai").and_then(pick),
         _ => None,
     }
 }
@@ -564,7 +570,7 @@ pub fn resolve_biz_api_key(base: &str, auth: &str, require_secret: bool) -> Opti
     let mut found = keys_array(&list)
         .into_iter()
         .find(|k| k.get("name").and_then(|n| n.as_str()) == Some(API_KEY_NAME))
-        .map(|k| k.clone());
+        .cloned();
     if found.is_none() {
         found = agent
             .post(&keys_url)
@@ -672,4 +678,102 @@ pub fn assemble_config(provider: &str, jwt: &str, access_token: &str) -> Value {
         _ => {}
     }
     json!({ "provider": providers })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_callback_standard() {
+        let url = "zcode://oauth/callback?code=test_code_123&state=state_abc";
+        let res = parse_callback(url).expect("should parse");
+        match res {
+            CallbackKind::Code { code, state } => {
+                assert_eq!(code, "test_code_123");
+                assert_eq!(state, "state_abc");
+            }
+            _ => panic!("expected code"),
+        }
+    }
+
+    #[test]
+    fn test_parse_callback_auth_code() {
+        let url = "zcode://oauth/callback?authCode=my_auth_code&state=my_state";
+        let res = parse_callback(url).expect("should parse");
+        match res {
+            CallbackKind::Code { code, state } => {
+                assert_eq!(code, "my_auth_code");
+                assert_eq!(state, "my_state");
+            }
+            _ => panic!("expected code"),
+        }
+    }
+
+    #[test]
+    fn test_parse_callback_with_extra_params_and_whitespace() {
+        let url = "  zcode://oauth/callback?utm_source=browser&code=code123&state=state456&channel_id=xyz  ";
+        let res = parse_callback(url).expect("should parse");
+        match res {
+            CallbackKind::Code { code, state } => {
+                assert_eq!(code, "code123");
+                assert_eq!(state, "state456");
+            }
+            _ => panic!("expected code"),
+        }
+    }
+
+    #[test]
+    fn test_parse_callback_query_only() {
+        let url = "?code=code_only&state=state_only";
+        let res = parse_callback(url).expect("should parse");
+        match res {
+            CallbackKind::Code { code, state } => {
+                assert_eq!(code, "code_only");
+                assert_eq!(state, "state_only");
+            }
+            _ => panic!("expected code"),
+        }
+    }
+
+    #[test]
+    fn test_parse_callback_full_http_url() {
+        let url = "https://zcode.z.ai/callback?code=http_code&state=http_state";
+        let res = parse_callback(url).expect("should parse");
+        match res {
+            CallbackKind::Code { code, state } => {
+                assert_eq!(code, "http_code");
+                assert_eq!(state, "http_state");
+            }
+            _ => panic!("expected code"),
+        }
+    }
+
+    #[test]
+    fn test_parse_callback_attribution_only() {
+        let url = "zcode://oauth/callback?channel_id=123&state=state_attr";
+        let res = parse_callback(url).expect("should parse attribution");
+        match res {
+            CallbackKind::Attribution => {}
+            _ => panic!("expected attribution"),
+        }
+    }
+
+    #[test]
+    fn test_parse_callback_missing_state() {
+        let url = "zcode://oauth/callback?code=code_no_state";
+        assert!(parse_callback(url).is_err());
+    }
+
+    #[test]
+    fn test_parse_callback_missing_code() {
+        let url = "zcode://oauth/callback?state=state_no_code";
+        assert!(parse_callback(url).is_err());
+    }
+
+    #[test]
+    fn test_parse_callback_invalid_url() {
+        let url = "not_a_callback_url";
+        assert!(parse_callback(url).is_err());
+    }
 }

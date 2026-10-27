@@ -38,6 +38,10 @@ const ICONS = {
   alert: P("M8 2.2 14.8 13.8H1.2z") + P("M8 6.4v3.2") + P("M8 11.6v.2"),
 
   empty: P("M3 3h10") + P("M3 13h10") + `<path d="M8 6.2v3.6M6.2 8h3.6" stroke-dasharray="2 1.6"/>`,
+
+  copy: P("M5.5 4.5h6a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-6a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1z") + P("M3.5 9.5h-1a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v1"),
+
+  external: P("M10 2.5h3.5v3.5") + P("M13.5 2.5 7.5 8.5") + P("M6.5 4.5H3.5a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V9.5"),
 };
 
 export function ic(name, size = 16, cls = "") {

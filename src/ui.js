@@ -222,3 +222,204 @@ export function openProviderModal(m) {
   const first = mask.querySelector(".pv-item");
   if (first) first.focus();
 }
+
+export function openLoginModal(info, opts = {}) {
+  document.querySelector(".login-mask")?.remove();
+
+  const mask = document.createElement("div");
+  mask.className = "login-mask";
+
+  const expiresAt = Number(info.expires_at_ms) || Date.now() + 300000;
+  const calcRemaining = () => Math.max(0, Math.round((expiresAt - Date.now()) / 1000));
+
+  mask.innerHTML = `
+    <div class="login-panel">
+      <div class="login-title">${t("oauth.modalTitle")}</div>
+      <div class="login-sub">${t("oauth.modalSub")}</div>
+
+      <div class="login-field">
+        <label class="login-label">${t("oauth.authUrlLabel")}</label>
+        <div class="login-url-row">
+          <input class="login-url-input" type="text" readonly value="${esc(info.authorize_url)}" />
+          <button class="btn-ghost login-copy-btn has-ic">
+            ${ic("copy", 14)} <span class="copy-text">${t("oauth.copyLink")}</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="login-browser-act">
+        <button class="btn-primary login-open-btn has-ic">
+          ${ic("external", 14)} <span>${t("oauth.openBrowser")}</span>
+        </button>
+      </div>
+
+      <div class="login-status-box">
+        <span class="cap-dot login-dot"></span>
+        <div class="login-status-info">
+          <div class="login-status-desc">${t("oauth.waiting")}</div>
+          <div class="login-countdown">${t("oauth.expiresIn", { sec: calcRemaining() })}</div>
+        </div>
+      </div>
+
+      <div class="login-manual-section">
+        <button type="button" class="login-manual-toggle">${t("oauth.manualToggle")}</button>
+        <div class="login-manual-body" style="display:none;">
+          <div class="login-manual-hint">${t("oauth.manualHint")}</div>
+          <div class="login-manual-row">
+            <input class="login-manual-input" type="text" placeholder="${esc(t("oauth.manualPlaceholder"))}" autocomplete="off" />
+            <button class="btn-primary login-manual-submit">${t("oauth.manualSubmit")}</button>
+          </div>
+          <div class="login-manual-err"></div>
+        </div>
+      </div>
+
+      <div class="login-actions">
+        <button class="btn-ghost login-cancel-btn">${t("common.cancel")}</button>
+      </div>
+    </div>`;
+
+  document.body.appendChild(mask);
+
+  const panel = mask.querySelector(".login-panel");
+  const urlInput = mask.querySelector(".login-url-input");
+  const copyBtn = mask.querySelector(".login-copy-btn");
+  const copyText = mask.querySelector(".copy-text");
+  const openBtn = mask.querySelector(".login-open-btn");
+  const descEl = mask.querySelector(".login-status-desc");
+  const countdownEl = mask.querySelector(".login-countdown");
+  const dotEl = mask.querySelector(".login-dot");
+  const manualToggle = mask.querySelector(".login-manual-toggle");
+  const manualBody = mask.querySelector(".login-manual-body");
+  const manualInput = mask.querySelector(".login-manual-input");
+  const manualSubmit = mask.querySelector(".login-manual-submit");
+  const manualErr = mask.querySelector(".login-manual-err");
+  const cancelBtn = mask.querySelector(".login-cancel-btn");
+
+  let copyTimer = null;
+  let closed = false;
+
+  const copyUrl = async () => {
+    if (calcRemaining() <= 0) return;
+    urlInput.select();
+    let ok = false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(info.authorize_url);
+        ok = true;
+      }
+    } catch {}
+    if (!ok) {
+      try {
+        ok = document.execCommand("copy");
+      } catch {}
+    }
+    if (ok) {
+      copyText.textContent = t("oauth.copied");
+      clearTimeout(copyTimer);
+      copyTimer = setTimeout(() => {
+        if (!closed) copyText.textContent = t("oauth.copyLink");
+      }, 2000);
+    } else {
+      toast(t("oauth.copyFail"), "warn");
+    }
+  };
+
+  copyBtn.addEventListener("click", copyUrl);
+  urlInput.addEventListener("click", () => urlInput.select());
+
+  openBtn.addEventListener("click", async () => {
+    try {
+      await invoke("open_external", { url: info.authorize_url });
+    } catch (e) {
+      toast(stripErr(e), "err");
+    }
+  });
+
+  const timer = setInterval(() => {
+    if (closed) return;
+    const rem = calcRemaining();
+    if (rem > 0) {
+      countdownEl.textContent = t("oauth.expiresIn", { sec: rem });
+    } else {
+      clearInterval(timer);
+      clearTimeout(copyTimer);
+      copyText.textContent = t("oauth.copyLink");
+      copyBtn.disabled = true;
+      descEl.textContent = t("oauth.expired");
+      countdownEl.textContent = "";
+      dotEl.className = "cap-dot err";
+      openBtn.disabled = true;
+    }
+  }, 1000);
+
+  manualToggle.addEventListener("click", () => {
+    const isHidden = manualBody.style.display === "none";
+    manualBody.style.display = isHidden ? "flex" : "none";
+    if (isHidden) manualInput.focus();
+  });
+
+  const submitManual = async () => {
+    const val = manualInput.value.trim();
+    if (!val) {
+      manualErr.textContent = t("oauth.manualEmpty");
+      return;
+    }
+    manualErr.textContent = "";
+    manualSubmit.disabled = true;
+    try {
+      await invoke("oauth_manual_callback", { flow: info.flow, callbackUrl: val });
+    } catch (e) {
+      const errStr = stripErr(e);
+      manualErr.textContent = errStr === "__superseded__"
+        ? t("oauth.expired")
+        : errStr === "__attribution__"
+        ? t("oauth.manualHint")
+        : errStr;
+      manualSubmit.disabled = false;
+    }
+  };
+
+  manualSubmit.addEventListener("click", submitManual);
+  manualInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      submitManual();
+    }
+  });
+
+  const close = (cancelled = true) => {
+    if (closed) return;
+    closed = true;
+    clearInterval(timer);
+    clearTimeout(copyTimer);
+    document.removeEventListener("keydown", onKey);
+    mask.remove();
+    if (cancelled) {
+      invoke("oauth_cancel", { flow: info.flow }).catch(() => {});
+      opts.onCancel?.();
+    }
+  };
+
+  const onKey = (e) => {
+    if (e.key === "Escape") close(true);
+  };
+  document.addEventListener("keydown", onKey);
+  panel.addEventListener("click", (e) => e.stopPropagation());
+  cancelBtn.addEventListener("click", () => close(true));
+  mask.addEventListener("click", (e) => {
+    if (e.target === mask) close(true);
+  });
+
+  openBtn.focus();
+
+  return {
+    flow: info.flow,
+    close: (cancelled = false) => close(cancelled),
+    setError: (err) => {
+      if (err) {
+        manualErr.textContent = stripErr(err);
+        manualBody.style.display = "flex";
+      }
+    },
+  };
+}

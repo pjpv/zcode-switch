@@ -189,7 +189,7 @@ fn classify_via(channels: &[Channel], fetch: &ProbeFetch) -> Option<ProbeOutcome
     let mut definite_channels = 0usize;
     for ch in channels {
         let verdict = match ch {
-            Channel::Monitor(key) => monitor_verdict(fetch(&quota::SUBSCRIPTION_URL, key)),
+            Channel::Monitor(key) => monitor_verdict(fetch(quota::SUBSCRIPTION_URL, key)),
             Channel::ZaiBilling(tok) => {
                 let url = format!("{}?app_version={}", quota::BILLING_BALANCE_URL, quota::zcode_app_version());
                 billing_verdict(fetch(&url, tok))

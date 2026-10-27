@@ -143,10 +143,10 @@ const actions = {
   },
 };
 
-const toggle = (on, onclickAttr, label, desc) => `
-  <div class="tog-row">
+const toggle = (on, onclickAttr, label, desc, disabled = false) => `
+  <div class="tog-row${disabled ? " disabled" : ""}">
     <div class="tog-info"><div class="tog-label">${label}</div><div class="tog-desc">${desc}</div></div>
-    <button class="toggle${on ? " on" : ""}" role="switch" aria-checked="${on}" aria-label="${label}" click="${onclickAttr}">
+    <button class="toggle${on ? " on" : ""}" role="switch" aria-checked="${on}" aria-label="${label}" ${disabled ? "disabled" : `click="${onclickAttr}"`}>
       <span class="knob"></span>
     </button>
   </div>`;
@@ -179,11 +179,10 @@ function render() {
       ${toggle(s.close_to_tray, "actions.toggleBehavior('tray')", t("s.closeTray"), t("s.closeTrayDesc"))}
       ${toggle(s.hot_switch, "actions.toggleBehavior('hot')", t("s.hotSwitch"), t("s.hotSwitchDesc"))}
       <label style="margin-top:14px">${t("s.authLabel")}</label>
-      ${toggle(s.auth_proxy_on, "actions.toggleAuthProxy()", t("s.proxyToggle"), t("s.proxyToggleDesc"))}
-      <div class="path-line" style="margin-top:6px">
+      ${toggle(false, "", t("s.proxyToggle"), t("s.proxyToggleDesc"), true)}
+      <div class="path-line" style="margin-top:6px;opacity:0.6">
         <input class="zcode-path auth-proxy" type="text" value="${esc(s.auth_proxy_url || "")}"
-          placeholder="${t("s.proxyPh")}" keydown="onProxyKey(event)">
-        <button class="btn-ghost" click="actions.saveProxy()">${t("common.save")}</button>
+          placeholder="${t("s.proxyPh")}" disabled>
       </div>
       <label style="margin-top:14px">${t("s.libLabel")}</label>
       <div class="lib-row">

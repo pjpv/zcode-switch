@@ -9,7 +9,7 @@ use std::path::Path;
 
 pub const PREFIX: &str = "enc:v1:";
 
-pub fn node_platform_for<'a>(os: &'a str) -> &'a str {
+pub fn node_platform_for(os: &str) -> &str {
     match os {
         "windows" => "win32",
         "macos" => "darwin",

@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "dist": "node scripts/dist.mjs",
-    "check:i18n": "node scripts/check-i18n-keys.mjs"
+    "check:i18n": "node scripts/check-i18n-keys.mjs",
+    "test:flow": "node scripts/test-login-flow.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1"

@@ -174,7 +174,7 @@ pub fn run(args: &[String]) -> (String, i32) {
             };
             let mut any = false;
             let mut items = vec![];
-            for acc in accounts.iter().filter(|a| only.as_deref().map_or(true, |id| id == a.id)) {
+            for acc in accounts.iter().filter(|a| only.as_deref().is_none_or(|id| id == a.id)) {
                 let res = ensure_virtual_device_mid(&paths, &acc.id).and_then(|mid| {
                     crate::claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))
                 });

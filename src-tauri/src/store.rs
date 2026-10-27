@@ -404,33 +404,80 @@ pub fn launch_zcode(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
+pub fn build_open_command(url: &str) -> Result<std::process::Command, String> {
+    if !url.starts_with("https://") {
+        return Err(crate::i18n::tr("err.url.https_only"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut c = no_window("open");
+        c.arg(url);
+        Ok(c)
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let mut c = no_window("xdg-open");
+        c.arg(url);
+        Ok(c)
+    }
+    #[cfg(windows)]
+    {
+        Err("Windows uses ShellExecuteW directly".into())
+    }
+}
+
+#[allow(dead_code)]
+pub fn encode_wide_url(url: &str) -> Result<Vec<u16>, String> {
+    if !url.starts_with("https://") {
+        return Err(crate::i18n::tr("err.url.https_only"));
+    }
+    let mut wide: Vec<u16> = url.encode_utf16().collect();
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
+pub fn open_url_windows(url: &str) -> Result<(), String> {
+    let wide_op: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+    let wide_url = encode_wide_url(url)?;
+
+    let ret = unsafe {
+        windows_sys::Win32::UI::Shell::ShellExecuteW(
+            0 as _,
+            wide_op.as_ptr(),
+            wide_url.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1, // SW_SHOWNORMAL
+        )
+    };
+    if (ret as usize) > 32 {
+        Ok(())
+    } else {
+        Err(crate::i18n::trf("err.url.open_failed", &[("code", &ret.to_string())]))
+    }
+}
+
 pub fn open_url(url: &str) -> Result<(), String> {
     if !url.starts_with("https://") {
-        return Err("仅支持 https 链接".into());
+        return Err(crate::i18n::tr("err.url.https_only"));
     }
     if in_sandbox() {
         return Ok(());
     }
     #[cfg(windows)]
-    let cmd = {
-        let mut c = no_window("cmd");
-        c.args(["/c", "start", "", url]);
-        c
-    };
-    #[cfg(target_os = "macos")]
-    let cmd = {
-        let mut c = no_window("open");
-        c.arg(url);
-        c
-    };
-    #[cfg(all(not(windows), not(target_os = "macos")))]
-    let cmd = {
-        let mut c = no_window("xdg-open");
-        c.arg(url);
-        c
-    };
-    let _ = detached(cmd).spawn();
-    Ok(())
+    {
+        open_url_windows(url)
+    }
+    #[cfg(not(windows))]
+    {
+        let cmd = build_open_command(url)?;
+        let _ = detached(cmd)
+            .spawn()
+            .map_err(|e| crate::i18n::trf("err.url.open_failed", &[("code", &e.to_string())]))?;
+        Ok(())
+    }
 }
 
 pub fn load_settings(paths: &Paths) -> Settings {
@@ -808,7 +855,7 @@ fn run_switch_probe(paths: &Paths, target: &Account, mid: Option<String>) -> Opt
 }
 
 fn probe_config_base(paths: &Paths, target: &Account) -> Option<Value> {
-    if target.config.is_none() { return None; }
+    target.config.as_ref()?;
     if new_gen_provider_config(&paths.data_root) { target.config.clone() }
     else { read_live_config(paths).or_else(|| target.config.clone()) }
 }
@@ -1168,7 +1215,7 @@ pub fn write_live_device_mid(paths: &Paths, mid: &str) -> Result<(), String> {
 }
 
 fn adopt_virtual_device_mid(paths: &Paths, acc: &mut Account) -> Result<(), String> {
-    if acc.virtual_device_mid.as_deref().map_or(false, |m| !m.trim().is_empty()) {
+    if acc.virtual_device_mid.as_deref().is_some_and(|m| !m.trim().is_empty()) {
         return Ok(());
     }
     let live_mid: Option<String> = fs::read_to_string(paths.live_telemetry())
@@ -1522,4 +1569,43 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         auth_proxy_url: settings.auth_proxy_url.clone(),
         language: crate::i18n::current().as_str().to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_wide_url_valid() {
+        let url = "https://zcode.z.ai/app/oauth/login?redirect=zcode%3A%2F%2Foauth%2Fcallback&app_version=1.7.0&state=flow-12345%26special%3D1";
+        let wide = encode_wide_url(url).expect("encode should succeed");
+        assert_eq!(*wide.last().unwrap(), 0, "must be null-terminated");
+        let decoded = String::from_utf16(&wide[..wide.len() - 1]).expect("utf16 decode");
+        assert_eq!(decoded, url, "URL with &, %, and query parameters must be preserved identically");
+    }
+
+    #[test]
+    fn test_encode_wide_url_rejects_non_https() {
+        assert!(encode_wide_url("http://example.com").is_err());
+        assert!(encode_wide_url("javascript:alert(1)").is_err());
+        assert!(encode_wide_url("cmd /c calc").is_err());
+    }
+
+    #[test]
+    fn test_open_failed_i18n_formatting() {
+        let err_zh = crate::i18n::trf("err.url.open_failed", &[("code", "2")]);
+        assert!(err_zh.contains("2"));
+        assert!(err_zh.contains("无法打开系统浏览器"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_build_open_command_macos_preserves_query_params() {
+        let url = "https://zcode.z.ai/app/oauth/login?redirect=zcode%3A%2F%2Foauth%2Fcallback&app_version=1.7.0&state=flow-12345";
+        let cmd = build_open_command(url).expect("build command should succeed");
+        let program = cmd.get_program().to_string_lossy();
+        assert_eq!(program, "open");
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        assert_eq!(args, vec![url], "open argument must be exactly the un-split URL");
+    }
 }

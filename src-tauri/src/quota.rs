@@ -786,8 +786,8 @@ fn merge_parts(parts: Vec<QuotaOverview>) -> QuotaOverview {
         used,
         remaining,
         percent_used,
-        plan_tier: pri_idx.map(|i| slots[i].tier.clone()).flatten(),
-        plan_expire: pri_idx.map(|i| slots[i].expire.clone()).flatten(),
+        plan_tier: pri_idx.and_then(|i| slots[i].tier.clone()),
+        plan_expire: pri_idx.and_then(|i| slots[i].expire.clone()),
         is_empty: slots.is_empty(),
         items,
         refreshed_at: refreshed,
@@ -1009,9 +1009,9 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
             server_percentage: percentage,
             unit: unit_str,
             period_end: reset.as_ref().map(|r| format!("{r} 重置")),
-            kind: (kind != "").then(|| kind.to_string()),
+            kind: (!kind.is_empty()).then(|| kind.to_string()),
             window: Some(window),
-            unit_code: (unit_code != "").then(|| unit_code.to_string()),
+            unit_code: (!unit_code.is_empty()).then(|| unit_code.to_string()),
             reset,
         };
         if typ == "TIME_LIMIT" && total.is_some() {
