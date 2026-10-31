@@ -6,6 +6,20 @@ on:
   pull_request:
 
 jobs:
+  frontend:
+    name: Frontend and keepalive adapter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check:i18n
+      - run: npm run test:keepalive
+      - run: npm run build
+
   test-windows:
     name: cargo test (windows)
     runs-on: windows-latest

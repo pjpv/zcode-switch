@@ -58,6 +58,7 @@ fn init_flow_at(url: &str, provider: &str, mid: &str) -> Result<FlowInit, String
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
+        .tls_connector(quota::native_tls_connector())
         .build();
     let mut req = agent.post(url);
     for (k, v) in quota::zai_oauth_headers_with_mid(&poll_token, Some(mid.to_string())).0 {
@@ -309,6 +310,7 @@ pub fn exchange_token(provider: &str, code: &str, state: &str, mid: &str) -> Res
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
+        .tls_connector(quota::native_tls_connector())
         .build();
     let mut req = agent.post(TOKEN_URL);
     for (k, v) in quota::zai_oauth_headers_with_mid("", Some(mid.to_string())).0 {
@@ -469,6 +471,7 @@ fn web_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(15))
+        .tls_connector(quota::native_tls_connector())
         .build()
 }
 

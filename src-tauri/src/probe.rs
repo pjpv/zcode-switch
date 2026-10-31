@@ -232,6 +232,7 @@ fn real_fetch(url: &str, token: &str, mid: Option<&str>) -> Result<Value, ProbeE
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(5))
         .timeout(Duration::from_secs(8))
+        .tls_connector(quota::native_tls_connector())
         .build();
     let mut req = agent.get(url);
     if url.contains("zcode.z.ai") {

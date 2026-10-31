@@ -166,6 +166,15 @@ pub fn run(args: &[String]) -> (String, i32) {
                 Err(e) => return (err(&e), 1),
             }
         }
+        "claim-refresh" => {
+            let Some(id) = flag(rest, "--id") else {
+                return (err("Usage: claim-refresh --id <account-id>"), 2);
+            };
+            match crate::claim::refresh_account(&paths, &id) {
+                Ok(result) => ok(serde_json::to_value(result).unwrap_or(Value::Null)),
+                Err(e) => return (err(&e), 1),
+            }
+        }
         "claim-preview" => {
             let only = flag(rest, "--id");
             let accounts = match list_accounts(&paths) {
@@ -175,7 +184,7 @@ pub fn run(args: &[String]) -> (String, i32) {
             let mut any = false;
             let mut items = vec![];
             for acc in accounts.iter().filter(|a| only.as_deref().map_or(true, |id| id == a.id)) {
-                let res = ensure_virtual_device_mid(&paths, &acc.id).and_then(|mid| {
+                let res = account_claim_mid(&paths, acc).and_then(|mid| {
                     crate::claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))
                 });
                 match res {

@@ -53,24 +53,7 @@ pub(crate) const ZCODE_LANG: &str = "zh-CN";
 const ZCODE_CHANNEL: &str = "stable";
 
 pub(crate) fn device_mid() -> Option<String> {
-    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            let home = crate::store::pick_home(
-                std::env::var("ZCODE_SWITCH_HOME").ok().map(std::path::PathBuf::from),
-                std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from),
-                std::env::var("HOME").ok().map(std::path::PathBuf::from),
-            );
-            let p = crate::store::resolve_data_root(&home)
-                .join(".zcode")
-                .join("v2")
-                .join("telemetry-state.json");
-            std::fs::read_to_string(p)
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|v| v.get("deviceMid").and_then(|m| m.as_str()).map(String::from))
-        })
-        .clone()
+    crate::store::read_device_mid(&crate::store::Paths::detect())
 }
 
 #[cfg(windows)]
@@ -163,9 +146,44 @@ pub(crate) fn zcode_app_version() -> String {
                     return normalize_version(&ver);
                 }
             }
-            CLIENT_APP_VERSION.to_string()
+            version_from_zcode_path()
+                .map(|v| normalize_version(&v))
+                .unwrap_or_else(|| CLIENT_APP_VERSION.to_string())
         })
         .clone()
+}
+
+/// 注册表查不到时（绿色版/自定义安装路径），直接从 settings 配置的
+/// ZCode.exe 读取文件版本，避免用过期的回退版本号导致服务端不认。
+#[cfg(windows)]
+fn version_from_zcode_path() -> Option<String> {
+    let paths = crate::store::Paths::detect();
+    let (exe, _) = crate::store::effective_zcode_path(&paths);
+    if exe.is_empty() {
+        return None;
+    }
+    let out = no_window("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "(Get-Item -LiteralPath '{}').VersionInfo.ProductVersion",
+                exe.replace('\'', "''")
+            ),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+#[cfg(not(windows))]
+fn version_from_zcode_path() -> Option<String> {
+    None
 }
 
 fn is_zcode_display_name(name: &str) -> bool {
@@ -184,6 +202,169 @@ fn normalize_version(v: &str) -> String {
 
 pub(crate) fn zai_billing_headers(token: &str) -> Vec<(String, String)> {
     zai_billing_headers_with_mid(token, device_mid())
+}
+
+/// zcode.z.ai 前置阿里云 ESA WAF：rustls 的 TLS 指纹会被静默降级
+/// （活动额度 preview/claim 返回空 payload、连接偶发超时）。
+/// 所有 HTTPS 请求显式改走 native-tls（Windows=Schannel），
+/// 其指纹与系统自带 HTTP 客户端一致，实测可通过。
+pub(crate) fn native_tls_connector() -> std::sync::Arc<native_tls::TlsConnector> {
+    let connector = native_tls::TlsConnector::new().expect("native-tls (Schannel) 初始化失败");
+    std::sync::Arc::new(connector)
+}
+
+/// 经系统自带 curl.exe（Schannel TLS）发送 HTTP 请求，返回 (HTTP 状态码, 响应体)。
+///
+/// 背景：zcode.z.ai 前置阿里云 ESA WAF，对进程内 Rust TLS 栈的握手指纹做了静默降级
+/// —— rustls 与 native-tls(schannel crate) 请求 /zcode-plan/billing/preview 时都会
+/// 收到空 payload（code:0 无 data）或连接超时，而相同请求头经系统 curl.exe、
+/// .NET HttpClient、Node/OpenSSL 发送均可正常返回（已用完全相同的请求字节逐一验证）。
+/// 因此活动额度相关的 preview/claim/激活上报统一改走 curl.exe。
+/// 请求头与请求体通过 stdin 的 curl 配置传递，凭据不会出现在命令行参数里。
+///
+/// 状态码为 0 表示 curl 传输失败（超时/网络错误），调用方应按网络错误处理。
+/// zcode.z.ai 请求统一出口的底层实现：curl(Schannel) 优先、ureq 兜底。
+///
+/// 阿里云 ESA WAF 会不定期调整对进程内 TLS 栈（rustls / schannel crate）的
+/// 指纹策略，单一通道随时可能整体失效。所有 zcode.z.ai 请求先走系统 curl.exe，
+/// 响应不完整（空 body / 非 JSON）或传输失败时自动回退 ureq，保证
+/// 「活动一变、WAF 一变」时链路仍有兜底。
+pub(crate) fn zcode_fetch_json_with_headers(
+    url: &str,
+    headers: &[(String, String)],
+    retry_429: bool,
+) -> Result<Value, String> {
+    let mut curl_err: Option<String> = None;
+    if let Ok((status, body)) = curl_http(url, "GET", headers, None, 25) {
+        if (200..400).contains(&status) {
+            if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                return Ok(v);
+            }
+        }
+        curl_err = Some(format!("HTTP {status}: {}", body.chars().take(120).collect::<String>()));
+    }
+    match http_get_json_with_headers(url, headers, retry_429) {
+        Ok(v) => Ok(v),
+        Err(_) => Err(curl_err.unwrap_or_else(|| "zcode fetch failed".into())),
+    }
+}
+
+pub(crate) fn zcode_fetch_json(url: &str, token: &str, retry_429: bool) -> Result<Value, String> {
+    zcode_fetch_json_with_headers(url, &zai_billing_headers_with_mid(token, device_mid()), retry_429)
+}
+
+/// POST 版：curl 优先、ureq 兜底，返回 (HTTP 状态码, 响应体)。
+pub(crate) fn zcode_post_json(
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+    timeout_secs: u64,
+) -> Result<(u16, String), String> {
+    if let Ok((status, resp_body)) = curl_http(url, "POST", headers, Some(body), timeout_secs) {
+        if status > 0 && !resp_body.trim().is_empty() {
+            return Ok((status, resp_body));
+        }
+    }
+    ureq_post_json(url, headers, body)
+}
+
+fn ureq_post_json(
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+) -> Result<(u16, String), String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .tls_connector(native_tls_connector())
+        .build();
+    let mut req = agent.post(url);
+    for (k, v) in headers {
+        req = req.set(k, v);
+    }
+    match req.send_string(body) {
+        Ok(r) => {
+            let status = r.status();
+            let text = r.into_string().unwrap_or_default();
+            Ok((status, text))
+        }
+        Err(ureq::Error::Status(code, r)) => Ok((code, r.into_string().unwrap_or_default())),
+        Err(e) => Err(format!("network error: {e}")),
+    }
+}
+
+fn curl_binary() -> &'static str {
+    if cfg!(windows) {
+        r"C:\Windows\System32\curl.exe"
+    } else {
+        "curl"
+    }
+}
+
+pub(crate) fn curl_http(
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: Option<&str>,
+    timeout_secs: u64,
+) -> Result<(u16, String), String> {
+    let exe = curl_binary();
+    if cfg!(windows) && !std::path::Path::new(exe).exists() {
+        return Err("curl.exe not found".into());
+    }
+    let esc = |v: &str| v.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut cfg = String::new();
+    cfg.push_str(&format!("url = \"{}\"\n", esc(url)));
+    cfg.push_str(&format!("request = \"{}\"\n", esc(method)));
+    cfg.push_str("silent\nshow-error\n");
+    cfg.push_str("connect-timeout = \"10\"\n");
+    cfg.push_str(&format!("max-time = \"{timeout_secs}\"\n"));
+    cfg.push_str("write-out = \"\\n%{http_code}\"\n");
+    for (k, v) in headers {
+        cfg.push_str(&format!("header = \"{}: {}\"\n", esc(k), esc(v)));
+    }
+    if let Some(b) = body {
+        cfg.push_str(&format!("data = \"{}\"\n", esc(b)));
+    }
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let mut child = no_window(exe)
+        .arg("-K")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("curl spawn: {e}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(cfg.as_bytes())
+            .map_err(|e| format!("curl stdin: {e}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("curl wait: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    if text.trim().is_empty() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            format!("curl exit {:?}", out.status.code())
+        } else {
+            err
+        });
+    }
+    let (body_text, status) = match text.rsplit_once('\n') {
+        Some((b, s)) => (b.to_string(), s.trim().parse::<u16>().unwrap_or(0)),
+        None => (text, 0),
+    };
+    if status == 0 {
+        // curl 传输失败（超时/连接错误）：带上 stderr 便于定位
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if !err.is_empty() {
+            return Err(err);
+        }
+    }
+    Ok((status, body_text))
 }
 
 pub(crate) fn zai_billing_headers_with_mid(token: &str, mid: Option<String>) -> Vec<(String, String)> {
@@ -227,7 +408,7 @@ fn bigmodel_headers(token: &str) -> Vec<(String, String)> {
     ]
 }
 
-#[derive(Debug, Clone, serde::Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Default)]
 pub struct QuotaItem {
     pub name: String,
     pub total: Option<f64>,
@@ -248,7 +429,15 @@ pub struct QuotaItem {
     pub reset: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Default)]
+pub struct PendingGrant {
+    pub name: String,
+    pub units: f64,
+    pub unit: String,
+    pub effective_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Default)]
 pub struct PlanSlot {
     #[serde(skip_serializing)]
     pub pid: String,
@@ -265,6 +454,8 @@ pub struct PlanSlot {
     pub remaining: Option<f64>,
     pub percent_used: Option<f64>,
     pub items: Vec<QuotaItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pending_grants: Vec<PendingGrant>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
@@ -377,32 +568,43 @@ pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str, new
 }
 
 fn http_get_json(url: &str, token: &str, retry_429: bool) -> Result<Value, String> {
-    let retry_delays = [500u64, 1500, 4000];
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(20))
-        .build();
     let headers = if url.contains("zcode.z.ai") {
         zai_billing_headers(token)
     } else {
         bigmodel_headers(token)
     };
+    http_get_json_with_headers(url, &headers, retry_429)
+}
+
+/// WAF 静默降级的典型表现是 HTTP 2xx + 空 body（或 code:0 无 data）。
+/// 空响应一律按传输失败处理（返回 Err），由上层回退其他通道；
+/// 绝不能把空数据当成“查询成功但无套餐”，否则活动一变就误报“探测不到”。
+fn http_get_json_with_headers(
+    url: &str,
+    headers: &[(String, String)],
+    retry_429: bool,
+) -> Result<Value, String> {
+    let retry_delays = [500u64, 1500, 4000];
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .tls_connector(native_tls_connector())
+        .build();
     let mut last_err: Option<String> = None;
     let mut backoff: std::slice::Iter<'_, u64> = if retry_429 { retry_delays.iter() } else { [].iter() };
     loop {
         let mut req = agent.get(url);
-        for (k, v) in &headers {
+        for (k, v) in headers {
             req = req.set(k, v);
         }
         let resp = req.call();
         match resp {
             Ok(r) => {
                 let text = r.into_string().map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
-                return Ok(if text.is_empty() {
-                    Value::Null
-                } else {
-                    serde_json::from_str(&text).unwrap_or(Value::String(text.clone()))
-                });
+                if text.trim().is_empty() {
+                    return Err(crate::i18n::tr("err.quota.empty_resp"));
+                }
+                return Ok(serde_json::from_str(&text).unwrap_or(Value::String(text.clone())));
             }
             Err(ureq::Error::Status(code, r)) => {
                 let body = r.into_string().unwrap_or_default();
@@ -483,8 +685,17 @@ fn query_with_token_via(token: &str, fetch: &FetchFn) -> Result<QuotaOverview, S
     Err(best_err.unwrap_or_else(|| crate::i18n::tr("err.quota.fail")))
 }
 
+/// zcode.z.ai 走 curl 优先 + ureq 兜底；bigmodel.cn 保持 ureq 直连。
+pub(crate) fn default_fetch(url: &str, token: &str) -> Result<Value, String> {
+    if url.starts_with(ZCODE_ORIGIN) {
+        zcode_fetch_json(url, token, true)
+    } else {
+        http_get_json(url, token, true)
+    }
+}
+
 fn query_with_token(token: &str) -> Result<QuotaOverview, String> {
-    query_with_token_via(token, &|url, tok| http_get_json(url, tok, true))
+    query_with_token_via(token, &|url, tok| default_fetch(url, tok))
 }
 
 pub(crate) fn business_ok(v: &Value) -> bool {
@@ -752,11 +963,11 @@ fn merge_parts(parts: Vec<QuotaOverview>) -> QuotaOverview {
         refreshed = refreshed.max(p.refreshed_at);
         for s in &p.plans {
             let dup = slot_src.iter().enumerate().any(|(i, src)| {
-                src != &p.source
+                slots[i] == *s || (src != &p.source
                     && slots[i].tier == s.tier
                     && slots[i].name == s.name
                     && !slots[i].items.is_empty()
-                    && !s.items.is_empty()
+                    && !s.items.is_empty())
             });
             if !dup {
                 slots.push(s.clone());
@@ -797,7 +1008,7 @@ fn merge_parts(parts: Vec<QuotaOverview>) -> QuotaOverview {
 }
 
 fn query_channels(channels: &[Channel]) -> Result<QuotaOverview, String> {
-    query_channels_via(channels, &|url, tok| http_get_json(url, tok, true))
+    query_channels_via(channels, &|url, tok| default_fetch(url, tok))
 }
 
 pub fn quota_for_live(home: &Path, creds: &Value, config: Option<&Value>) -> Result<QuotaOverview, String> {
@@ -879,9 +1090,9 @@ fn looks_like_dt(s: &str) -> bool {
 }
 
 fn extract_expire(obj: &Value) -> Option<String> {
-    const KEYS: [&str; 12] = [
+    const KEYS: [&str; 13] = [
         "nextRenewTime", "expireTime", "expire_time", "endTime", "end_time", "expireAt", "expiredTime", "validEndTime",
-        "expires_at", "expiresAt", "expired_at", "period_end",
+        "expires_at", "expiresAt", "expired_at", "period_end", "ends_at",
     ];
     for k in KEYS {
         let Some(v) = obj.get(k) else { continue };
@@ -1068,6 +1279,7 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
             remaining,
             percent_used,
             items: items.clone(),
+            pending_grants: vec![],
         }]
     } else {
         vec![]
@@ -1247,6 +1459,8 @@ fn tier_rank(code: Option<&str>) -> u8 {
 
 fn normalize_balance(balance_data: &Value) -> QuotaOverview {
     let balance = unwrap(balance_data);
+    let server_time = balance.get("server_time").and_then(Value::as_i64)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
     if std::env::var("ZSW_DUMP_SUB").is_ok() {
         eprintln!("[zsw] billing/balance raw: {balance_data}");
     }
@@ -1274,6 +1488,22 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                         tier_code: Some(tier_code),
                         name: Some(pname.filter(|s| !s.trim().is_empty()).unwrap_or(pid)),
                         expire: extract_expire(pl),
+                        pending_grants: pl.get("entitlements").and_then(Value::as_array)
+                            .into_iter().flatten().filter_map(|ent| {
+                                let effective = ent.get("effective_at")?.as_i64()?;
+                                let units = ent.get("grant_units").and_then(to_number)?;
+                                if effective <= server_time || !units.is_finite() || units <= 0.0 {
+                                    return None;
+                                }
+                                Some(PendingGrant {
+                                    name: ent.get("show_name").and_then(Value::as_str)
+                                        .unwrap_or("Unknown").to_string(),
+                                    units,
+                                    unit: ent.get("unit_type").and_then(Value::as_str)
+                                        .unwrap_or("quota").to_string(),
+                                    effective_at: expiry_field(&Value::from(effective))?,
+                                })
+                            }).collect(),
                         ..Default::default()
                     }
                 })
@@ -1470,5 +1700,80 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
         refreshed_at: 0,
         source: String::new(),
         plans: slots,
+    }
+}
+
+#[cfg(test)]
+mod pending_grant_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn dev_day() -> Value {
+        json!({"code": 0, "data": {
+            "server_time": 1792760827_i64,
+            "balances": [],
+            "plans": [{"status": "active", "plan_id": "zcode-v3-start-plan-1024",
+                "name": "ZCode 1024 Dev Day", "ends_at": 1792976400_i64,
+                "entitlements": [
+                    {"show_name": "GLM-5.3-Flash", "grant_units": 300000000,
+                        "unit_type": "token", "effective_at": 1792767600_i64},
+                    {"show_name": "GLM-5.3", "grant_units": 200000000,
+                        "unit_type": "token", "effective_at": 1792767600_i64}
+                ]}]
+        }})
+    }
+
+    #[test]
+    fn claimed_future_grants_survive_empty_balance_without_becoming_spendable() {
+        let ov = merge_parts(vec![normalize_balance(&dev_day())]);
+        assert_eq!(ov.plans.len(), 1);
+        assert!(!ov.is_empty);
+        let p = &ov.plans[0];
+        assert_eq!(p.name.as_deref(), Some("ZCode 1024 Dev Day"));
+        assert!(p.expire.is_some());
+        assert_eq!(p.pending_grants.len(), 2);
+        assert_eq!(p.pending_grants.iter().map(|g| g.units).sum::<f64>(), 500000000.0);
+        assert_eq!(p.pending_grants[0].effective_at, expiry_field(&json!(1792767600_i64)).unwrap());
+        assert!(p.items.is_empty());
+        assert!(ov.total.is_none() && ov.remaining.is_none() && ov.percent_used.is_none());
+    }
+
+    #[test]
+    fn after_activation_only_actual_balance_supplies_available_quota() {
+        let mut resp = dev_day();
+        resp["data"]["server_time"] = json!(1792767600_i64);
+        resp["data"]["balances"] = json!([{
+            "plan_id": "zcode-v3-start-plan-1024", "show_name": "GLM-5.3-Flash",
+            "total_units": 300000000, "used_units": 1000, "remaining_units": 299999000,
+            "unit_type": "token"
+        }]);
+        let ov = normalize_balance(&resp);
+        assert!(ov.plans[0].pending_grants.is_empty());
+        assert_eq!(ov.remaining, Some(299999000.0));
+        assert_eq!(ov.total, Some(300000000.0));
+    }
+
+    #[test]
+    fn unclaimed_account_has_no_future_grants() {
+        let ov = merge_parts(vec![normalize_balance(&json!({"data": {
+            "server_time": 1792760827_i64, "balances": [], "plans": []
+        }}))]);
+        assert!(ov.plans.is_empty() && ov.is_empty && ov.remaining.is_none());
+    }
+
+    #[test]
+    fn repeated_billing_channel_does_not_duplicate_the_same_future_grant() {
+        let mut first = normalize_balance(&dev_day());
+        first.source = "zcode.z.ai/billing".into();
+        let ov = merge_parts(vec![first.clone(), first]);
+        assert_eq!(ov.plans.len(), 1);
+        assert_eq!(ov.plans[0].pending_grants.len(), 2);
+    }
+
+    #[test]
+    fn expired_plan_does_not_advertise_future_grants() {
+        let mut resp = dev_day();
+        resp["data"]["plans"][0]["status"] = json!("expired");
+        assert!(normalize_balance(&resp).plans.is_empty());
     }
 }

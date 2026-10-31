@@ -4,7 +4,6 @@ use crate::zcrypto;
 use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
-use std::time::Duration;
 
 pub const BILLING_PREVIEW_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/preview";
 pub const BILLING_CLAIM_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim";
@@ -36,6 +35,30 @@ pub struct CaptchaConfig {
     pub region: String,
     pub prefix: String,
     pub scene_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimRefreshResult {
+    pub plans: Vec<ClaimPlan>,
+    pub activated: bool,
+    pub activation_error: Option<String>,
+}
+
+pub fn refresh_account(paths: &crate::store::Paths, id: &str) -> Result<ClaimRefreshResult, String> {
+    let acc = crate::store::load_account(paths, id)?;
+    let mid = crate::store::account_claim_mid(paths, &acc)?;
+    let secret = zcrypto::default_secret(&paths.home);
+    let token = claim_token(&acc.credentials, acc.config.as_ref(), &secret)?;
+    let (activated, activation_error) = match telemetry_user_id(&paths.home, &acc.credentials) {
+        Some(uid) => match report_activation_events(&uid, &mid, &token) {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(e)),
+        },
+        None => (false, None),
+    };
+    let plans = preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))?;
+    Ok(ClaimRefreshResult { plans, activated, activation_error })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,11 +143,19 @@ fn decrypt_credential(v: &str, secret: &str) -> Option<String> {
     }
 }
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(CLAIM_TIMEOUT_SECS))
-        .build()
+/// curl 转发场景下复刻原 ureq http_err 的错误文本：从响应体 JSON 里提取 msg。
+fn status_err(prefix: &str, status: u16, body: &str) -> String {
+    let msg = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| ["msg", "message", "error"]
+            .iter()
+            .find_map(|k| v.get(k).and_then(|x| x.as_str()).map(String::from)))
+        .unwrap_or_default();
+    if status == 0 {
+        format!("{prefix} network error")
+    } else {
+        format!("{prefix} HTTP {status}: {msg}")
+    }
 }
 
 pub const EVENT_REPORT_URL: &str = "https://zcode.z.ai/api/v1/event/report";
@@ -184,11 +215,16 @@ fn device_os_category() -> &'static str {
     }
 }
 
-pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(ACTIVATION_TIMEOUT_SECS))
-        .build();
+pub fn report_activation_events(user_id: &str, device_mid: &str, token: &str) -> Result<(), String> {
+    report_activation_events_at(EVENT_REPORT_URL, user_id, device_mid, token)
+}
+
+fn report_activation_events_at(
+    url: &str,
+    user_id: &str,
+    device_mid: &str,
+    token: &str,
+) -> Result<(), String> {
     for element in ACTIVATION_EVENTS {
         let body = activation_event_body(
             element,
@@ -196,15 +232,19 @@ pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), S
             user_id,
             device_mid,
         );
-        let resp = agent
-            .post(EVENT_REPORT_URL)
-            .set("Content-Type", "application/json")
-            .send_json(body)
-            .map_err(|e| {
-                crate::i18n::trf("err.claim.activate_req", &[("e", http_err("", e).trim())])
-            })?
-            .into_string()
+        let body_text = serde_json::to_string(&body)
             .map_err(|e| crate::i18n::trf("err.claim.activate_req", &[("e", &e.to_string())]))?;
+        let mut headers = quota::zai_billing_headers_with_mid(token, Some(device_mid.to_string()));
+        headers.push(("Content-Type".into(), "application/json".into()));
+        let (status, resp) =
+            quota::zcode_post_json(url, &headers, &body_text, ACTIVATION_TIMEOUT_SECS)
+                .map_err(|e| crate::i18n::trf("err.claim.activate_req", &[("e", &e)]))?;
+        if status == 0 || status >= 400 {
+            return Err(crate::i18n::trf(
+                "err.claim.activate_req",
+                &[("e", &status_err("", status, &resp).trim())],
+            ));
+        }
         let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
         let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
@@ -227,34 +267,80 @@ pub fn preview_plans(
         quota::zcode_app_version(),
         quota::client_platform()
     );
-    preview_once(&url, &token, device_mid)
+    // 认证视角失败（网络/WAF）时同样尝试匿名回退，避免活动一变就整体探测不到。
+    let (auth_err, mut out) = match preview_once(&url, &token, device_mid.clone()) {
+        Ok(v) => (None, v),
+        Err(e) => (Some(e), vec![]),
+    };
+    if out.is_empty() {
+        // 2026-10-30 起 zcode.z.ai 的 billing/preview 对携带有效 JWT 的请求
+        // 不再返回可领计划（一律空 data），导致界面永远不显示「可领」。
+        // 回退：用同一设备的匿名视角（不带 Authorization）获取当前活动计划，
+        // 再用 billing/balance 查出该账号已持有的 plan_id 并排除——
+        // 剩下的才是该账号真正可领的。匿名视角按设备 MID 判定资格，
+        // 设备领取过一次后同样返回空，因此无需额外去重。
+        if let Some(anon) = preview_anonymous(&url, device_mid.clone()) {
+            // owned 查询失败时降级为空集合：宁可多显示让服务器裁决，
+            // 不能因为一次辅助查询失败就漏掉新活动。
+            let owned = owned_plan_ids(&token, device_mid).unwrap_or_default();
+            out = anon
+                .into_iter()
+                .filter(|p| !owned.contains(&p.plan_id))
+                .collect();
+        } else if let Some(e) = auth_err {
+            return Err(e);
+        }
+    }
+    Ok(out)
 }
 
-fn http_err(prefix: &str, e: ureq::Error) -> String {
-    if let ureq::Error::Status(code, resp) = e {
-        let body = resp.into_string().unwrap_or_default();
-        let msg = serde_json::from_str::<Value>(&body)
-            .ok()
-            .and_then(|v| ["msg", "message", "error"]
-                .iter()
-                .find_map(|k| v.get(k).and_then(|x| x.as_str()).map(String::from)))
-            .unwrap_or_default();
-        return format!("{prefix} HTTP {code}: {msg}");
+/// 匿名视角的活动预览：与 preview_once 相同的请求，但不带 Authorization。
+fn preview_anonymous(url: &str, mid: Option<String>) -> Option<Vec<ClaimPlan>> {
+    let headers: Vec<(String, String)> = quota::zai_billing_headers_with_mid("", mid)
+        .into_iter()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("Authorization"))
+        .collect();
+    let v = quota::zcode_fetch_json_with_headers(url, &headers, false).ok()?;
+    if v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
+        return None;
     }
-    format!("{prefix} {e}")
+    let plans = v
+        .pointer("/data/plans")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out: Vec<ClaimPlan> = plans.iter().filter_map(parse_plan).collect();
+    out.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.plan_id.cmp(&b.plan_id)));
+    Some(out)
+}
+
+/// 该账号在 billing/balance 里已持有的 plan_id 列表（None = 查询失败，不回退）。
+fn owned_plan_ids(token: &str, mid: Option<String>) -> Option<Vec<String>> {
+    let url = format!(
+        "{}?app_version={}",
+        quota::BILLING_BALANCE_URL,
+        quota::zcode_app_version()
+    );
+    let headers = quota::zai_billing_headers_with_mid(token, mid);
+    let v = quota::zcode_fetch_json_with_headers(&url, &headers, false).ok()?;
+    if v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
+        return None;
+    }
+    Some(
+        v.pointer("/data/plans")
+            .and_then(|p| p.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|p| p.get("plan_id").and_then(|x| x.as_str()).map(String::from))
+            .collect(),
+    )
 }
 
 fn preview_once(url: &str, token: &str, mid: Option<String>) -> Result<Vec<ClaimPlan>, String> {
-    let mut req = agent().get(url);
-    for (k, v) in quota::zai_billing_headers_with_mid(token, mid) {
-        req = req.set(&k, &v);
-    }
-    let resp = req
-        .call()
-        .map_err(|e| http_err(&crate::i18n::tr("err.claim.preview_req"), e))?
-        .into_string()
-        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
-    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+    let headers = quota::zai_billing_headers_with_mid(token, mid);
+    let v = quota::zcode_fetch_json_with_headers(url, &headers, false)
+        .map_err(|e| format!("{} {e}", crate::i18n::tr("err.claim.preview_req")))?;
     let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
         return Err(failure_message(code, &v));
@@ -283,27 +369,27 @@ pub fn submit_claim(
     }
     let secret = zcrypto::default_secret(home);
     let token = claim_token(creds, config, &secret)?;
-    let mut req = agent().post(BILLING_CLAIM_URL);
-    for (k, v) in quota::zai_billing_headers_with_mid(&token, device_mid) {
-        req = req.set(&k, &v);
+    let mut headers = quota::zai_billing_headers_with_mid(&token, device_mid);
+    headers.push(("X-Aliyun-Captcha-Verify-Param".into(), captcha_param.trim().to_string()));
+    if let Some(r) = captcha_region.map(str::trim).filter(|r| !r.is_empty()) {
+        headers.push(("X-Aliyun-Captcha-Verify-Region".into(), r.to_string()));
     }
-    req = req.set("X-Aliyun-Captcha-Verify-Param", captcha_param.trim());
-    if let Some(r) = captcha_region.filter(|r| !r.trim().is_empty()) {
-        req = req.set("X-Aliyun-Captcha-Verify-Region", r.trim());
+    headers.push(("Content-Type".into(), "application/json".into()));
+    let body = serde_json::json!({ "plan_id": plan_id }).to_string();
+    let (status, resp) =
+        quota::zcode_post_json(BILLING_CLAIM_URL, &headers, &body, CLAIM_TIMEOUT_SECS)
+            .map_err(|e| ClaimError {
+                code: -1,
+                message: format!("{} {e}", crate::i18n::tr("err.claim.claim_req")),
+                next_at: None,
+            })?;
+    if status == 0 || status >= 400 {
+        return Err(ClaimError {
+            code: -1,
+            message: status_err(&crate::i18n::tr("err.claim.claim_req"), status, &resp),
+            next_at: None,
+        });
     }
-    let resp = req
-        .send_json(serde_json::json!({ "plan_id": plan_id }))
-        .map_err(|e| ClaimError {
-            code: -1,
-            message: http_err(&crate::i18n::tr("err.claim.claim_req"), e),
-            next_at: None,
-        })?
-        .into_string()
-        .map_err(|e| ClaimError {
-            code: -1,
-            message: crate::i18n::trf("err.http.read", &[("e", &e.to_string())]),
-            next_at: None,
-        })?;
     let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
     let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
@@ -313,16 +399,9 @@ pub fn submit_claim(
 }
 
 pub fn fetch_captcha_config() -> Result<CaptchaConfig, String> {
-    let mut req = agent().get(CLIENT_CONFIGS_URL);
-    for (k, v) in quota::zai_billing_headers("") {
-        req = req.set(&k, &v);
-    }
-    let resp = req
-        .call()
-        .map_err(|e| crate::i18n::trf("err.claim.config_req", &[("e", &e.to_string())]))?
-        .into_string()
-        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
-    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+    let headers = quota::zai_billing_headers("");
+    let v = quota::zcode_fetch_json_with_headers(CLIENT_CONFIGS_URL, &headers, false)
+        .map_err(|e| crate::i18n::trf("err.claim.config_req", &[("e", &e)]))?;
     if v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
         return Err(crate::i18n::tr("err.claim.config_unavailable"));
     }
@@ -438,5 +517,105 @@ pub fn failure_message(code: i64, body: &Value) -> String {
         base
     } else {
         crate::i18n::trf("claim.fail.with_server", &[("base", &base), ("server_msg", &server_msg)])
+    }
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    fn mock_reports(
+        responses: Vec<&'static str>,
+    ) -> (String, thread::JoinHandle<Vec<(HashMap<String, String>, Value)>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/event/report", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let mut requests = Vec::new();
+            for response in responses {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline, "missing activation request");
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => panic!("mock accept failed: {e}"),
+                    }
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.trim(), "POST /event/report HTTP/1.1");
+                let mut headers = HashMap::new();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let (name, value) = line.split_once(':').unwrap();
+                    headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
+                }
+                let length = headers["content-length"].parse::<usize>().unwrap();
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                requests.push((headers, serde_json::from_slice(&body).unwrap()));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(), response
+                ).unwrap();
+            }
+            requests
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn activation_reports_authenticate_both_events_with_existing_device_context() {
+        let (url, server) = mock_reports(vec![r#"{"code":0}"#, r#"{"code":0}"#]);
+        report_activation_events_at(&url, "existing-user", "existing-mid", "test-session-token").unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        let version = quota::zcode_app_version();
+        for ((headers, body), element) in requests.iter().zip(ACTIVATION_EVENTS) {
+            assert_eq!(headers["authorization"], "Bearer test-session-token");
+            assert_eq!(headers["content-type"], "application/json");
+            assert_eq!(headers["x-device-mid"], "existing-mid");
+            assert_eq!(headers["user-agent"], format!("ZCode/{version}"));
+            assert_eq!(headers["x-zcode-app-version"], version);
+            assert_eq!(headers["x-platform"], quota::client_platform());
+            assert_eq!(headers["x-title"], "Z Code@electron");
+            assert_eq!(headers["http-referer"], "https://zcode.z.ai");
+            assert_eq!(headers["x-release-channel"], "stable");
+            assert_eq!(headers["x-client-language"], quota::ZCODE_LANG);
+            assert_eq!(headers["x-client-timezone"], quota::client_timezone());
+            assert_eq!(headers["x-os-category"], std::env::consts::OS);
+            if let Some(os_version) = quota::os_version() {
+                assert_eq!(headers["x-os-version"], os_version);
+            }
+            uuid::Uuid::parse_str(&headers["x-request-id"]).unwrap();
+            let event_id = body["event_id"].as_str().unwrap();
+            uuid::Uuid::parse_str(event_id).unwrap();
+            assert_eq!(*body, activation_event_body(element, event_id, "existing-user", "existing-mid"));
+        }
+        assert_ne!(requests[0].1["event_id"], requests[1].1["event_id"]);
+    }
+
+    #[test]
+    fn activation_reports_preserve_server_failure() {
+        let (url, server) = mock_reports(vec![r#"{"code":3007,"msg":"not eligible"}"#]);
+        let error = report_activation_events_at(&url, "existing-user", "existing-mid", "test-token")
+            .unwrap_err();
+        assert!(error.contains("not eligible"));
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 }

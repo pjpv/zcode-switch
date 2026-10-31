@@ -25,10 +25,19 @@ chrono = "0.4"
 aes-gcm = "0.10"
 base64 = "0.22"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
-ureq = { version = "2", features = ["json"] }
+# zcode.z.ai 由阿里云 ESA WAF 前置，会对 rustls 的 TLS 指纹静默降级（返回空 payload /
+# 连接超时），导致活动额度 preview/claim/激活上报全部拿不到数据。
+# native-tls 在 Windows 上走 Schannel，指纹与系统客户端一致，可正常通过。
+# 注意：ureq 的 native-tls 特性不会自动成为默认后端，必须在每个 AgentBuilder 上
+# 显式调用 .tls_connector(...)（见 quota::native_tls_connector）。
+ureq = { version = "2", features = ["json", "native-tls"] }
+native-tls = "0.2"
 sys-locale = "0.3"
 
 [target.'cfg(windows)'.dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+percent-encoding = "2"
 windows-sys = { version = "0.52", features = [
     "Win32_System_Console",
     "Win32_Storage_FileSystem",
