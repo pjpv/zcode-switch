@@ -304,10 +304,41 @@ pub fn run(args: &[String]) -> (String, i32) {
             if !ok_path {
                 return (err(&crate::i18n::trf("err.zcode.path_invalid", &[("p", &p)])), 1);
             }
-            match launch_zcode(&p) {
+            match launch_zcode(&paths, &p) {
                 Ok(()) => ok(json!({ "launched": p })),
                 Err(e) => return (err(&e), 1),
             }
+        }
+        // gateway              → 状态/池视图（只读）
+        // gateway --on|--off --port N --key K --solver-python P --solver-script S → 修改设置
+        "gateway" => {
+            if rest.iter().any(|a| a == "--on" || a == "--off" || flag(rest, "--port").is_some() || flag(rest, "--key").is_some() || flag(rest, "--solver-python").is_some() || flag(rest, "--solver-script").is_some()) {
+                let mut s = load_settings(&paths);
+                if rest.contains(&"--on".to_string()) {
+                    s.gateway_enabled = Some(true);
+                }
+                if rest.contains(&"--off".to_string()) {
+                    s.gateway_enabled = Some(false);
+                }
+                if let Some(p) = flag(rest, "--port").and_then(|v| v.parse::<u16>().ok()) {
+                    s.gateway_port = Some(p);
+                }
+                if let Some(k) = flag(rest, "--key") {
+                    s.gateway_key = Some(k.trim().to_string());
+                }
+                if let Some(p) = flag(rest, "--solver-python") {
+                    s.captcha_solver_python = Some(p.trim().to_string());
+                }
+                if let Some(p) = flag(rest, "--solver-script") {
+                    s.captcha_solver_script = Some(p.trim().to_string());
+                }
+                if let Err(e) = save_settings(&paths, &s) {
+                    return (err(&e), 1);
+                }
+                let view = crate::gateway::status_view(&paths);
+                return (ok(view), 0);
+            }
+            return (ok(crate::gateway::status_view(&paths)), 0);
         }
         other => return (err(&crate::i18n::trf("cli.unknown_cmd", &[("cmd", other)])), 2),
     };

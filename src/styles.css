@@ -1036,3 +1036,42 @@ input:focus-visible,
 .pv-item:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 .pv-item .pv-arrow { color: var(--ink-mute); font-family: var(--mono); }
 .pv-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
+
+/* ── 聚合网关：账号行内状态行 + toolbar 端点 pill ── */
+.row-gw-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  color: var(--ink-mute);
+  padding: 3px 2px 1px;
+  min-height: 20px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.row-gw-line .status-dot { width: 8px; height: 8px; flex: none; }
+.row-gw-line .status-dot.run { background: var(--green); box-shadow: 0 0 6px rgba(111, 187, 111, .55); }
+.row-gw-line .status-dot.off { background: #6b6f78; }
+.row-gw-line .gw-sep { opacity: .45; }
+.row-gw-line .gw-err { color: #c98f8f; }
+.gw-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+}
+.gw-pill .gw-endpoint {
+  height: 36px;
+  padding: 0 12px;
+  border-radius: 7px;
+  border: 1px dashed var(--amber-deep);
+  background: transparent;
+  color: var(--amber);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .15s ease;
+}
+.gw-pill .gw-endpoint:hover { background: rgba(232, 163, 61, .1); }

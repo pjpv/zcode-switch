@@ -10,20 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [
-      {
-        "title": "Z·SWITCH",
-        "width": 680,
-        "height": 820,
-        "minWidth": 520,
-        "minHeight": 640,
-        "resizable": true,
-        "center": true,
-        "theme": "Dark",
-        "backgroundColor": "#0a0a0c",
-        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server"
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://o.alicdn.com https://*.alicdn.com https://*.aliyuncs.com; style-src 'self' 'unsafe-inline' https://*.alicdn.com https://*.aliyuncs.com; img-src 'self' data: blob: https:; font-src 'self' data: https://o.alicdn.com https://*.alicdn.com; connect-src ipc: http://ipc.localhost https://*.aliyuncs.com https://*.aliyun.com https://ynuf.aliapp.org https://o.alicdn.com https://*.alicdn.com; frame-src 'self' about: blob: https://*.aliyuncs.com https://*.aliyun.com https://*.alicdn.com; worker-src 'self' blob:; object-src 'none'",
       "devCsp": "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://o.alicdn.com https://*.alicdn.com https://*.aliyuncs.com; style-src 'self' 'unsafe-inline' https://*.alicdn.com https://*.aliyuncs.com; img-src 'self' data: blob: https:; font-src 'self' data: https://o.alicdn.com https://*.alicdn.com; connect-src ipc: http://ipc.localhost http://127.0.0.1:5173 ws://127.0.0.1:5173 https://*.aliyuncs.com https://*.aliyun.com https://ynuf.aliapp.org https://o.alicdn.com https://*.alicdn.com; frame-src 'self' about: blob: https://*.aliyuncs.com https://*.aliyun.com https://*.alicdn.com; worker-src 'self' blob:; object-src 'none'",

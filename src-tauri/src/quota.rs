@@ -377,13 +377,18 @@ pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str, new
 }
 
 fn http_get_json(url: &str, token: &str, retry_429: bool) -> Result<Value, String> {
+    http_get_json_with_mid(url, token, retry_429, device_mid())
+}
+
+/// 网关额度刷新用：显式传账号级 mid（每号独立设备指纹），不再走全局缓存
+fn http_get_json_with_mid(url: &str, token: &str, retry_429: bool, mid: Option<String>) -> Result<Value, String> {
     let retry_delays = [500u64, 1500, 4000];
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
         .build();
     let headers = if url.contains("zcode.z.ai") {
-        zai_billing_headers(token)
+        zai_billing_headers_with_mid(token, mid)
     } else {
         bigmodel_headers(token)
     };
@@ -583,8 +588,10 @@ pub(crate) fn classify_biz_err(code: i64) -> BizErrFamily {
     use BizErrFamily::*;
     match code {
         401 | 1006 => Auth,
-        1005 => QuotaExhausted,
+        1005 | 1113 | 1310 => QuotaExhausted, // 1113 无余额 / 1310 周·月上限（网关同款语义）
         3002 | 3008 | 3009 | 3010 => RateLimited,
+        1302 | 1303 => RateLimited,           // 429 承载的真限流（Z.ai 频控）
+        3012 => SecurityReject,               // 客户端版本/风控（405 承载）
         3007 => SecurityReject,
         3001 | 3006 | 3102 => Param,
         2007 => Server,
@@ -800,12 +807,38 @@ fn query_channels(channels: &[Channel]) -> Result<QuotaOverview, String> {
     query_channels_via(channels, &|url, tok| http_get_json(url, tok, true))
 }
 
+fn query_channels_with_mid(channels: &[Channel], mid: Option<String>) -> Result<QuotaOverview, String> {
+    query_channels_via(channels, &|url, tok| http_get_json_with_mid(url, tok, true, mid.clone()))
+}
+
 pub fn quota_for_live(home: &Path, creds: &Value, config: Option<&Value>) -> Result<QuotaOverview, String> {
     let secret = zcrypto::default_secret(home);
     let new_gen = crate::store::new_gen_provider_config(home);
     let channels = pick_channels(creds, config, &secret, new_gen);
     if !channels.is_empty() {
         if let Ok(ov) = query_channels(&channels) {
+            return Ok(ov);
+        }
+    }
+    let tokens = candidate_tokens(creds, config, &secret, new_gen);
+    query_quota(&tokens)
+}
+
+/// 网关专用：每号额度刷新。data_root 单独传入修正代际判定
+/// （quota_for_live 用 home 判 new_gen，data_root ≠ home 时会误判——这里以
+/// data_root 为准），并给 billing 查询注入账号级 virtual_device_mid。
+pub fn quota_for_account(
+    home: &Path,
+    data_root: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    mid: Option<String>,
+) -> Result<QuotaOverview, String> {
+    let secret = zcrypto::default_secret(home);
+    let new_gen = crate::store::new_gen_provider_config(data_root);
+    let channels = pick_channels(creds, config, &secret, new_gen);
+    if !channels.is_empty() {
+        if let Ok(ov) = query_channels_with_mid(&channels, mid) {
             return Ok(ov);
         }
     }

@@ -39,6 +39,7 @@ fn detached(mut c: std::process::Command) -> std::process::Command {
     c
 }
 
+#[derive(Clone)]
 pub struct Paths {
     pub home: PathBuf,
     pub data_root: PathBuf,
@@ -142,6 +143,17 @@ pub struct Settings {
     pub language: Option<String>,
     #[serde(default)]
     pub auto_claim: Option<bool>,
+    // 聚合网关（默认关；key 为空时网关拒绝一切请求）
+    #[serde(default)]
+    pub gateway_enabled: Option<bool>,
+    #[serde(default)]
+    pub gateway_port: Option<u16>,
+    #[serde(default)]
+    pub gateway_key: Option<String>,
+    #[serde(default)]
+    pub captcha_solver_python: Option<String>,
+    #[serde(default)]
+    pub captcha_solver_script: Option<String>,
 }
 
 impl Settings {
@@ -149,6 +161,8 @@ impl Settings {
     pub fn close_to_tray(&self) -> bool { self.close_to_tray.unwrap_or(true) }
     pub fn hot_switch(&self) -> bool { self.hot_switch.unwrap_or(false) }
     pub fn auto_claim(&self) -> bool { self.auto_claim.unwrap_or(false) }
+    pub fn gateway_enabled(&self) -> bool { self.gateway_enabled.unwrap_or(false) }
+    pub fn gateway_port(&self) -> u16 { self.gateway_port.unwrap_or(8718) }
     pub fn auth_proxy(&self) -> Option<&str> {
         if self.auth_proxy_on.unwrap_or(false) {
             self.auth_proxy_url.as_deref().map(str::trim).filter(|s| !s.is_empty())
@@ -190,6 +204,11 @@ pub struct AppState {
     pub auth_proxy_on: bool,
     pub auth_proxy_url: Option<String>,
     pub language: String,
+    pub gateway_enabled: bool,
+    pub gateway_port: u16,
+    pub gateway_key_set: bool,
+    pub captcha_solver_python: Option<String>,
+    pub captcha_solver_script: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -306,6 +325,128 @@ pub(crate) fn in_sandbox() -> bool {
     std::env::var("ZCODE_SWITCH_HOME").is_ok()
 }
 
+// ---------- Linux 进程管理：/proc 直读 + kill(2)，不依赖 pgrep/pkill ----------
+// AppImage 的 AppRun 会把 PATH / LD_LIBRARY_PATH 改写成挂载点优先，外部
+// pgrep/pkill 是否可用取决于打包内容与桌面会话；直接读 /proc 并在进程内
+// 发信号没有这两个前提，且能精确拿到重启所需的启动命令行。
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct ZProc {
+    pid: i32,
+    comm: String,
+    argv: Vec<String>,
+}
+
+/// 重启 ZCode 时沿用的启动方式：命令行、工作目录、必要的环境变量。
+/// 例如 zcode-pro 的启动链路是
+/// `ELECTRON_RUN_AS_NODE=1 /opt/ZCode/zcode --no-warnings /usr/lib/zcode-pro/cli.mjs`，
+/// 直接用 `/opt/ZCode/zcode` 重启会丢掉注入层，必须原样还原。
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct LaunchSpec {
+    program: PathBuf,
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+    env: Vec<(String, String)>,
+}
+
+#[cfg(target_os = "linux")]
+static REMEMBERED_LAUNCH: std::sync::Mutex<Option<LaunchSpec>> = std::sync::Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+const LAUNCH_ENV_KEYS: &[&str] = &[
+    "ELECTRON_RUN_AS_NODE",
+    "ELECTRON_OZONE_PLATFORM_HINT",
+    "ZCODEPRO_ZCODE_PATH",
+    "ZCODE_DATA_BASE_DIR",
+    "NODE_OPTIONS",
+];
+
+#[cfg(target_os = "linux")]
+fn read_proc(pid: i32) -> Option<ZProc> {
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?.trim().to_string();
+    let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let argv: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).to_string())
+        .collect();
+    Some(ZProc { pid, comm, argv })
+}
+
+#[cfg(target_os = "linux")]
+fn zcode_procs() -> Vec<ZProc> {
+    let Ok(rd) = fs::read_dir("/proc") else { return Vec::new() };
+    let mut out = Vec::new();
+    for ent in rd.flatten() {
+        let Some(pid) = ent.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
+        if let Some(p) = read_proc(pid) {
+            if p.comm == "zcode" || p.comm == "ZCode" {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn proc_launch_env(pid: i32) -> Vec<(String, String)> {
+    let Ok(raw) = fs::read(format!("/proc/{pid}/environ")) else { return Vec::new() };
+    raw.split(|b| *b == 0)
+        .filter_map(|kv| {
+            let s = String::from_utf8_lossy(kv);
+            let (k, v) = s.split_once('=')?;
+            LAUNCH_ENV_KEYS.contains(&k).then(|| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// 记下当前 ZCode 的启动方式。优先带 `cli.mjs` 的包装器进程（zcode-pro 等），
+/// 其次任何带参数的 zcode 进程；GUI 主进程的 cmdline 只有 `ZCode`，单独用不了。
+#[cfg(target_os = "linux")]
+fn capture_launch_spec(procs: &[ZProc]) {
+    let mut ranked: Vec<&ZProc> = procs.iter().filter(|p| p.argv.len() > 1).collect();
+    ranked.sort_by_key(|p| {
+        let has_cli = p.argv.iter().any(|a| a.ends_with("cli.mjs"));
+        let has_node = p.argv.iter().any(|a| a == "--no-warnings");
+        std::cmp::Reverse((has_cli as u8) * 2 + (has_node as u8))
+    });
+    let Some(p) = ranked.first() else { return };
+    let program = PathBuf::from(&p.argv[0]);
+    if !program.exists() {
+        return;
+    }
+    let spec = LaunchSpec {
+        program,
+        args: p.argv[1..].to_vec(),
+        cwd: fs::read_link(format!("/proc/{}/cwd", p.pid)).ok(),
+        env: proc_launch_env(p.pid),
+    };
+    eprintln!(
+        "[zsw] 已记录 ZCode 启动方式：{} {:?}（重启时按此还原）",
+        spec.program.display(),
+        spec.args
+    );
+    if let Ok(mut g) = REMEMBERED_LAUNCH.lock() {
+        *g = Some(spec);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_no_zcode(limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if zcode_procs().is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 #[cfg(windows)]
 pub fn zcode_running() -> bool {
     if in_sandbox() {
@@ -322,7 +463,15 @@ pub fn zcode_running() -> bool {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn zcode_running() -> bool {
+    if in_sandbox() {
+        return false;
+    }
+    !zcode_procs().is_empty()
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub fn zcode_running() -> bool {
     if in_sandbox() {
         return false;
@@ -357,7 +506,44 @@ pub fn kill_zcode() -> Result<bool, String> {
     Ok(!zcode_running())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn kill_zcode() -> Result<bool, String> {
+    if in_sandbox() {
+        return Ok(true);
+    }
+    let procs = zcode_procs();
+    if procs.is_empty() {
+        return Ok(true);
+    }
+    capture_launch_spec(&procs);
+    for p in &procs {
+        unsafe {
+            libc::kill(p.pid, libc::SIGTERM);
+        }
+    }
+    if wait_no_zcode(Duration::from_secs(4)) {
+        return Ok(true);
+    }
+    let left = zcode_procs();
+    eprintln!(
+        "[zsw] SIGTERM 后仍有 {} 个 ZCode 进程，改发 SIGKILL：{:?}",
+        left.len(),
+        left.iter().map(|p| format!("{}:{}", p.pid, p.comm)).collect::<Vec<_>>()
+    );
+    for p in &left {
+        unsafe {
+            libc::kill(p.pid, libc::SIGKILL);
+        }
+    }
+    if wait_no_zcode(Duration::from_secs(4)) {
+        return Ok(true);
+    }
+    let rest: Vec<String> = zcode_procs().iter().map(|p| format!("{}:{}", p.pid, p.comm)).collect();
+    eprintln!("[zsw] SIGKILL 后 ZCode 仍在运行：{}", rest.join(", "));
+    Ok(false)
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub fn kill_zcode() -> Result<bool, String> {
     if in_sandbox() {
         return Ok(true);
@@ -390,15 +576,93 @@ pub fn kill_zcode() -> Result<bool, String> {
     Ok(!zcode_running())
 }
 
-pub fn launch_zcode(path: &str) -> Result<(), String> {
+/// 从 AppImage 里启动其它程序时，AppRun 注入的挂载点环境会一并继承：
+/// `LD_LIBRARY_PATH` 指向 AppImage 自带的 GTK/glib，`GTK_PATH`/`GDK_PIXBUF_MODULE_FILE`
+/// 也指向挂载点。ZCode 是 Electron + 系统库，带着这些变量启动会加载错版本库而
+/// 启动失败或白屏，因此 spawn 前按需剥离。
+#[cfg(unix)]
+fn sanitize_appimage_env(c: &mut Command) {
+    let appdir = std::env::var("APPDIR").ok().filter(|s| !s.is_empty());
+    if appdir.is_none() && std::env::var_os("APPIMAGE").is_none() {
+        return;
+    }
+    for key in [
+        "APPDIR",
+        "APPIMAGE",
+        "APPIMAGE_EXTRACT_AND_RUN",
+        "ARGV0",
+        "OWD",
+        "GTK_DATA_PREFIX",
+        "GTK_EXE_PREFIX",
+        "GTK_PATH",
+        "GTK_THEME",
+        "GTK_IM_MODULE_FILE",
+        "GDK_PIXBUF_MODULE_FILE",
+        "GIO_MODULE_DIR",
+        "GI_TYPELIB_PATH",
+        "GSETTINGS_SCHEMA_DIR",
+        "LD_LIBRARY_PATH",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "PERLLIB",
+        "QT_PLUGIN_PATH",
+        "GST_PLUGIN_SYSTEM_PATH",
+        "GST_PLUGIN_SYSTEM_PATH_1_0",
+    ] {
+        c.env_remove(key);
+    }
+    if let Some(dir) = appdir {
+        if let Ok(v) = std::env::var("XDG_DATA_DIRS") {
+            let kept: Vec<&str> = v
+                .split(':')
+                .filter(|p| !p.is_empty() && !p.starts_with(dir.as_str()))
+                .collect();
+            if kept.is_empty() {
+                c.env_remove("XDG_DATA_DIRS");
+            } else {
+                c.env("XDG_DATA_DIRS", kept.join(":"));
+            }
+        }
+    }
+}
+
+/// 启动 ZCode。设置里显式指定了路径就用它；否则优先沿用上次杀掉前记下的
+/// 启动方式（zcode-pro 等包装器的完整命令行 + 关键环境），保证切换后重启的
+/// 实例与用户平时点图标启动的一致。
+pub fn launch_zcode(paths: &Paths, fallback: &str) -> Result<(), String> {
     if in_sandbox() {
         return Ok(());
     }
-    let p = PathBuf::from(path);
-    if !p.exists() {
-        return Err(trf("err.zcode.missing", &[("path", path)]));
+    let explicit = load_settings(paths).zcode_path.is_some();
+    let mut program = PathBuf::from(fallback);
+    let mut args: Vec<String> = Vec::new();
+    let mut cwd: Option<PathBuf> = None;
+    let mut extra_env: Vec<(String, String)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    if !explicit {
+        if let Some(spec) = REMEMBERED_LAUNCH.lock().ok().and_then(|g| g.clone()) {
+            if spec.program.exists() {
+                program = spec.program;
+                args = spec.args;
+                cwd = spec.cwd;
+                extra_env = spec.env;
+            }
+        }
     }
-    detached(Command::new(&p))
+    if !program.exists() {
+        return Err(trf("err.zcode.missing", &[("path", &program.display().to_string())]));
+    }
+    let mut cmd = Command::new(&program);
+    cmd.args(&args);
+    if let Some(dir) = cwd.filter(|d| d.is_dir()) {
+        cmd.current_dir(dir);
+    }
+    for (k, v) in &extra_env {
+        cmd.env(k, v);
+    }
+    #[cfg(unix)]
+    sanitize_appimage_env(&mut cmd);
+    detached(cmd)
         .spawn()
         .map_err(|e| trf("err.zcode.launch", &[("e", &e.to_string())]))?;
     Ok(())
@@ -653,6 +917,11 @@ fn cred_plain(creds: &Value, key: &str, home: &std::path::Path) -> Option<String
     } else {
         Some(v.to_string())
     }
+}
+
+/// 网关用：读取凭据字段（enc:v1 自动解密）
+pub(crate) fn cred_plain_opt(creds: &Value, key: &str, home: &std::path::Path) -> Option<String> {
+    cred_plain(creds, key, home)
 }
 
 pub(crate) const JWT_CLOCK_SKEW_MS: i64 = 30_000;
@@ -928,7 +1197,7 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
     let mut launched = false;
     if restart {
         let (p, ok) = effective_zcode_path(paths);
-        if ok && launch_zcode(&p).is_ok() {
+        if ok && launch_zcode(paths, &p).is_ok() {
             launched = true;
         }
     }
@@ -1521,5 +1790,41 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         auth_proxy_on: settings.auth_proxy_on.unwrap_or(false),
         auth_proxy_url: settings.auth_proxy_url.clone(),
         language: crate::i18n::current().as_str().to_string(),
+        gateway_enabled: settings.gateway_enabled(),
+        gateway_port: settings.gateway_port(),
+        gateway_key_set: settings.gateway_key.as_deref().is_some_and(|k| !k.trim().is_empty()),
+        captcha_solver_python: settings.captcha_solver_python.clone(),
+        captcha_solver_script: settings.captcha_solver_script.clone(),
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_proc_tests {
+    use super::*;
+
+    #[test]
+    fn reads_own_proc_entry() {
+        let p = read_proc(std::process::id() as i32).expect("read self");
+        assert!(!p.comm.is_empty());
+        assert!(!p.argv.is_empty());
+    }
+
+    #[test]
+    fn launch_env_only_returns_whitelisted_keys() {
+        for (k, _) in proc_launch_env(std::process::id() as i32) {
+            assert!(LAUNCH_ENV_KEYS.contains(&k.as_str()), "unexpected key {k}");
+        }
+    }
+
+    #[test]
+    fn captures_wrapper_launch_spec_when_zcode_running() {
+        let procs = zcode_procs();
+        if procs.is_empty() {
+            return;
+        }
+        capture_launch_spec(&procs);
+        let spec = REMEMBERED_LAUNCH.lock().unwrap().clone().expect("spec captured");
+        assert!(spec.program.exists(), "program missing: {}", spec.program.display());
+        assert!(!spec.args.is_empty(), "wrapper launch should carry args");
+    }
 }

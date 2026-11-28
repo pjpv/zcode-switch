@@ -1,5 +1,6 @@
 pub mod cipher;
 pub mod cli;
+pub mod gateway;
 pub mod i18n;
 mod claim;
 mod flowlog;
@@ -127,7 +128,7 @@ fn run_tray_action(app: AppHandle, action: String) {
             "capture" => store::capture_current(&paths, None).map(|a| json!({ "name": a.name })),
             "launch" => {
                 let (p, ok) = effective_zcode_path(&paths);
-                if ok { store::launch_zcode(&p).map(|_| json!({})) } else { Err(i18n::trf("err.zcode.path_invalid", &[("p", &p)])) }
+                if ok { store::launch_zcode(&paths, &p).map(|_| json!({})) } else { Err(i18n::trf("err.zcode.path_invalid", &[("p", &p)])) }
             }
             "kill" => match store::kill_zcode() {
                 Ok(true) => Ok(json!({})),
@@ -820,6 +821,13 @@ fn open_captcha_window(app: &AppHandle, auto: bool) -> Result<(), String> {
     .resizable(false)
     .additional_browser_args("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server")
     .visible(false)
+    .on_navigation(|url| {
+        let ok = is_app_nav(&url);
+        if !ok {
+            eprintln!("[zsw] 拦截 captcha 窗口外导航: {url}");
+        }
+        ok
+    })
     .build()
     .map_err(|e| e.to_string())?;
     center_over_main(app, &win, w, h);
@@ -920,6 +928,13 @@ async fn open_settings(app: AppHandle) -> Result<(), String> {
     .resizable(true)
     .additional_browser_args("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server")
     .visible(false)
+    .on_navigation(|url| {
+        let ok = is_app_nav(&url);
+        if !ok {
+            eprintln!("[zsw] 拦截 settings 窗口外导航: {url}");
+        }
+        ok
+    })
     .build()
     .map_err(|e| e.to_string())?;
     center_over_main(&app, &win, w, h);
@@ -1113,7 +1128,7 @@ async fn launch_zcode(app: AppHandle) -> Result<(), String> {
     if !ok {
         return Err(i18n::trf("err.zcode.path_invalid_hint", &[("p", &p)]));
     }
-    let r = store::launch_zcode(&p);
+    let r = store::launch_zcode(&paths, &p);
     rebuild_tray(&app);
     r
 }
@@ -1123,7 +1138,76 @@ async fn open_external(url: String) -> Result<(), String> {
     store::open_url(&url)
 }
 
+#[tauri::command]
+async fn gateway_status() -> Result<serde_json::Value, String> {
+    Ok(gateway::status_view(&Paths::detect()))
+}
+
+/// 网关设置：任一字段传 Some 才更新；`regenerate_key` 生成新随机密钥。
+/// 保存后按新配置重启网关（enabled=false 即停）。
+#[tauri::command]
+async fn gateway_set(
+    app: AppHandle,
+    enabled: Option<bool>,
+    port: Option<u16>,
+    key: Option<String>,
+    regenerate_key: Option<bool>,
+    solver_python: Option<String>,
+    solver_script: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let paths = Paths::detect();
+    let mut settings = store::load_settings(&paths);
+    if let Some(v) = enabled {
+        settings.gateway_enabled = Some(v);
+    }
+    if let Some(v) = port {
+        if v < 1024 {
+            return Err(i18n::tr("err.gateway.bad_port"));
+        }
+        settings.gateway_port = Some(v);
+    }
+    if let Some(v) = key {
+        settings.gateway_key = Some(v.trim().to_string());
+    }
+    if regenerate_key == Some(true) {
+        settings.gateway_key = Some(uuid::Uuid::new_v4().to_string());
+    }
+    if let Some(v) = solver_python {
+        settings.captcha_solver_python = Some(v.trim().to_string());
+    }
+    if let Some(v) = solver_script {
+        settings.captcha_solver_script = Some(v.trim().to_string());
+    }
+    store::save_settings(&paths, &settings)?;
+    let cfg = gateway::config_from_settings(&settings);
+    let port = gateway::apply_config(cfg, paths).map_err(|e| format!("gateway: {e}"))?;
+    let _ = app.emit("state-changed", ());
+    Ok(json!({
+        "ok": true,
+        "running": port > 0,
+        "port": port,
+        "key_set": settings.gateway_key.as_deref().is_some_and(|k| !k.trim().is_empty()),
+        "key": settings.gateway_key,
+    }))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+
+/// 应用内 WebView 导航白名单：本应用页面（生产 tauri://localhost / Windows
+/// http://tauri.localhost）、dev Vite、about/data/blob。白名单外的顶层导航
+/// 一律拒绝——WebView 没有地址栏，一旦被带到外部页面（本地其它服务/网页）
+/// 就回不去，只能杀进程。2026-11-28 实证：窗口被导航到本机另一项目页面。
+fn is_app_nav(url: &tauri::Url) -> bool {
+    let s = url.as_str();
+    s.starts_with("tauri://localhost")
+        || s.starts_with("http://tauri.localhost")
+        || s.starts_with("http://127.0.0.1:5173")
+        || s.starts_with("ws://127.0.0.1:5173")
+        || s.starts_with("about:")
+        || s.starts_with("data:")
+        || s.starts_with("blob:")
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -1170,6 +1254,8 @@ pub fn run() {
             open_external,
             open_settings,
             reveal_main,
+            gateway_status,
+            gateway_set,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -1189,6 +1275,46 @@ pub fn run() {
             i18n::init_from_settings(&store::load_settings(&Paths::detect()));
             if let Ok(data_dir) = app.path().app_local_data_dir() {
                 flowlog::init(&data_dir);
+            }
+            // 主窗口：代码构建以挂导航守卫（tauri.conf.json 声明式窗口拿不到
+            // on_navigation）。属性与原 conf 声明一致。
+            // data_directory 独立隔离：默认目录里持久化的 webkit 会话可能带着
+            // 上次被导航走的外部页面 URL，启动即"恢复"到别站（2026-11-28 实证）。
+            let main_data = app
+                .path()
+                .app_local_data_dir()?
+                .join("main-webview");
+            tauri::WebviewWindowBuilder::new(
+                app,
+                "main",
+                tauri::WebviewUrl::App("index.html".into()),
+            )
+            .title("Z·SWITCH")
+            .data_directory(main_data)
+            .inner_size(680.0, 820.0)
+            .min_inner_size(520.0, 640.0)
+            .resizable(true)
+            .center()
+            .theme(Some(tauri::Theme::Dark))
+            .background_color(tauri::window::Color(10, 10, 12, 255))
+            .additional_browser_args("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server")
+            .on_navigation(|url| {
+                let ok = is_app_nav(&url);
+                if !ok {
+                    eprintln!("[zsw] 拦截主窗口外导航: {url}");
+                }
+                ok
+            })
+            .build()?;
+            // 聚合网关：按设置启动（托盘常驻，随进程退出）
+            {
+                let paths = Paths::detect();
+                let cfg = gateway::config_from_settings(&store::load_settings(&paths));
+                if cfg.enabled {
+                    if let Err(e) = gateway::apply_config(cfg, paths) {
+                        eprintln!("[zsw-gw] 启动失败: {e}");
+                    }
+                }
             }
             let _tray = TrayIconBuilder::with_id(TRAY_ID)
                 .icon(app.default_window_icon().expect("no window icon").clone())

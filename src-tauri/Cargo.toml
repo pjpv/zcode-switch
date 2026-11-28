@@ -20,13 +20,19 @@ tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 chrono = "0.4"
 aes-gcm = "0.10"
 base64 = "0.22"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 ureq = { version = "2", features = ["json"] }
 sys-locale = "0.3"
+# 本地聚合网关：axum 承接入站（/v1/messages 等），tokio 承载 async；
+# 上游调用沿用同步 ureq（spawn_blocking 内跑，流式经 mpsc 泵进 axum Body）
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "sync"] }
+# tokio mpsc Receiver → Stream（axum Body::from_stream 需要）
+tokio-stream = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [
@@ -35,6 +41,10 @@ windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_Security",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# 直接对 /proc 里扫到的 PID 发信号，不依赖 AppImage 是否打包了 pgrep/pkill
+libc = "0.2"
 
 [target.'cfg(not(windows))'.dependencies]
 # X-Client-Timezone 的 IANA 名（Node Intl 同源）
