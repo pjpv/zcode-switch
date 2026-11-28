@@ -141,6 +141,48 @@ const actions = {
         state.auth_proxy_on ? t("s.proxySavedOn") : t("s.proxySavedOff"));
     });
   },
+
+  async toggleGateway() {
+    await guard(async () => {
+      const r = await invoke("gateway_set", { enabled: !state.gateway_enabled, port: null, key: null, regenerateKey: null, solverPython: null, solverScript: null });
+      await refresh(); render();
+      toast(r.running ? t("s.gwOnToast", { port: r.port }) : t("s.gwOffToast"), "ok",
+        r.running ? (r.key_set ? t("s.gwKeyOk") : t("s.gwKeyMissing")) : undefined);
+    });
+  },
+
+  async saveGatewayNet() {
+    const port = parseInt(document.querySelector(".settings input.gw-port")?.value || "", 10);
+    const key = (document.querySelector(".settings input.gw-key")?.value || "").trim();
+    await guard(async () => {
+      const r = await invoke("gateway_set", {
+        enabled: null, port: Number.isFinite(port) && port > 0 ? port : null,
+        key: key || null, regenerateKey: null, solverPython: null, solverScript: null,
+      });
+      await refresh(); render();
+      toast(t("s.gwSaved", { port: r.port }), "ok", r.running ? t("s.gwSavedRunning") : t("s.gwSavedStopped"));
+    });
+  },
+
+  async genGatewayKey() {
+    await guard(async () => {
+      const r = await invoke("gateway_set", { enabled: null, port: null, key: null, regenerateKey: true, solverPython: null, solverScript: null });
+      await refresh(); render();
+      const input = document.querySelector(".settings input.gw-key");
+      if (input && r.key) { input.value = r.key; }
+      toast(t("s.gwKeyGen"), "ok");
+    });
+  },
+
+  async saveSolver() {
+    const py = (document.querySelector(".settings input.gw-solver-py")?.value || "").trim();
+    const sc = (document.querySelector(".settings input.gw-solver-sc")?.value || "").trim();
+    await guard(async () => {
+      await invoke("gateway_set", { enabled: null, port: null, key: null, regenerateKey: null, solverPython: py, solverScript: sc });
+      await refresh(); render();
+      toast(t("s.gwSolverSaved"));
+    });
+  },
 };
 
 const toggle = (on, onclickAttr, label, desc) => `
@@ -185,6 +227,21 @@ function render() {
           placeholder="${t("s.proxyPh")}" keydown="onProxyKey(event)">
         <button class="btn-ghost" click="actions.saveProxy()">${t("common.save")}</button>
       </div>
+      <label style="margin-top:14px">${t("s.gwLabel")}</label>
+      ${toggle(s.gateway_enabled, "actions.toggleGateway()", t("s.gwToggle"), t("s.gwToggleDesc"))}
+      <div class="path-line" style="margin-top:6px">
+        <input class="zcode-path gw-port" type="text" inputmode="numeric" value="${esc(String(s.gateway_port || 8787))}">
+        <input class="zcode-path gw-key" type="text" value="" placeholder="${s.gateway_key_set ? t("s.gwKeySetPh") : t("s.gwKeyEmptyPh")}" keydown="onGatewayKey(event)">
+        <button class="btn-ghost" click="actions.genGatewayKey()">${t("s.gwGenKey")}</button>
+        <button class="btn-ghost" click="actions.saveGatewayNet()">${t("common.save")}</button>
+      </div>
+      <div class="hint">${t("s.gwHint")}</div>
+      <div class="path-line" style="margin-top:4px">
+        <input class="zcode-path gw-solver-py" type="text" value="${esc(s.captcha_solver_python || "")}" placeholder="${t("s.gwSolverPyPh")}">
+        <input class="zcode-path gw-solver-sc" type="text" value="${esc(s.captcha_solver_script || "")}" placeholder="${t("s.gwSolverScPh")}">
+        <button class="btn-ghost" click="actions.saveSolver()">${t("common.save")}</button>
+      </div>
+      <div class="hint">${t("s.gwSolverHint")}</div>
       <label style="margin-top:14px">${t("s.libLabel")}</label>
       <div class="lib-row">
         <button class="btn-ghost has-ic" click="actions.importFiles()">${ic("import", 14)} ${t("s.importBtn")}</button>
@@ -197,13 +254,14 @@ function render() {
         <button class="btn-ghost" click="actions.savePath()">${t("common.save")}</button>
       </div>
       <div class="hint">${t("s.hint")}</div>
-      <div class="gh-row"><a class="gh-link" href="https://github.com/pjpv/zcode-switch" target="_blank" rel="noopener" click="actions.openGitHub()">${t("s.githubLink")}</a>${appVer ? `<span class="ver">v${esc(appVer)}</span>` : ""}</div>
+      <div class="gh-row"><button class="gh-link" click="actions.openGitHub()">${t("s.githubLink")}</button>${appVer ? `<span class="ver">v${esc(appVer)}</span>` : ""}</div>
     </section>`;
 }
 
 window.actions = actions;
 window.onPathKey = (e) => { if (e.key === "Enter") actions.savePath(); };
 window.onProxyKey = (e) => { if (e.key === "Enter") actions.saveProxy(); };
+window.onGatewayKey = (e) => { if (e.key === "Enter") actions.saveGatewayNet(); };
 installDelegation();
 
 listen("state-changed", () => {

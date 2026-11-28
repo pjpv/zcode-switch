@@ -26,9 +26,24 @@ const DYNAMIC = [
 ];
 
 const callRe = /\bt\(\s*(["'])((?:(?!\1).)+)\1/g; // 只匹配引号串；模板串走 DYNAMIC
-const files = readdirSync(join(root, "src")).filter((f) => f.endsWith(".js"));
-for (const f of files) {
-  const src = readFileSync(join(root, "src", f), "utf8");
+function scanFiles(dir, rel = "") {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    const relative = join(rel, entry.name);
+    if (entry.isDirectory()) {
+      scanFiles(path, relative);
+    } else if (/\.(js|html)$/.test(entry.name)) {
+      const src = readFileSync(path, "utf8");
+      for (const m of src.matchAll(callRe)) {
+        const key = m[2];
+        if (!zh.has(key) || !en.has(key)) errs.push(`${relative}: 用了未定义 key: ${key}`);
+      }
+    }
+  }
+}
+scanFiles(join(root, "src"));
+for (const f of readdirSync(root).filter((name) => name.endsWith(".html"))) {
+  const src = readFileSync(join(root, f), "utf8");
   for (const m of src.matchAll(callRe)) {
     const key = m[2];
     if (!zh.has(key) || !en.has(key)) errs.push(`${f}: 用了未定义 key: ${key}`);

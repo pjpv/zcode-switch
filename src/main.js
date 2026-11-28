@@ -6,6 +6,7 @@ import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
 
 const $app = document.getElementById("app");
 let state = null;
+let gw = null;
 let renaming = null;
 let busy = false;
 let appVer = "";
@@ -57,6 +58,7 @@ function idLabel(id) {
 async function refresh() {
   state = await invoke("get_state");
   if (state?.language) init(state.language);
+  gw = await invoke("gateway_status").catch(() => null);
 }
 
 function uiLocked() {
@@ -139,6 +141,14 @@ function autoPillTitle(s) {
 
 const actions = {
   async refresh() { await refresh(); render(); },
+
+  async backup() {
+    await guard(async () => {
+      const r = await invoke("create_account_backup");
+      toast(t("m.backupCreated", { count: r.account_count }), "ok");
+      await refresh(); render();
+    });
+  },
 
   async capture() {
     await guard(async () => {
@@ -280,6 +290,21 @@ const actions = {
       toast(t("m.toastKilled"));
       await refresh(); render();
     });
+  },
+
+  async toggleGatewayMain() {
+    await guard(async () => {
+      await invoke("gateway_set", { enabled: !state.gateway_enabled, port: null, key: null, regenerateKey: null, solverPython: null, solverScript: null });
+      await refresh(); render();
+      toast(gw?.running ? t("s.gwOnToast", { port: gw.port }) : t("s.gwOffToast"));
+    });
+  },
+
+  async copyGwEndpoint(endpoint) {
+    try {
+      await navigator.clipboard.writeText(endpoint);
+      toast(t("gw.copied"), "ok");
+    } catch { toast(t("gw.copyFail"), "err"); }
   },
 
   async openSettings() {
@@ -686,6 +711,47 @@ function planGroupHtml(p) {
   </div>`;
 }
 
+const GW_STATUS_KEY = { active: "gw.status.active", cooling: "gw.status.cooling", exhausted: "gw.status.exhausted", invalid: "gw.status.invalid", disabled: "gw.status.disabled" };
+
+function gwStatusMeta(acc) {
+  const cls = { active: "run", cooling: "", exhausted: "", invalid: "off", disabled: "off" }[acc.status] || "off";
+  const cooling = acc.cooling_until > 0 && acc.status === "cooling"
+    ? ` · ${t("gw.coolingLeft", { s: Math.max(1, Math.ceil((acc.cooling_until - Date.now()) / 1000)) })}`
+    : "";
+  const err = acc.last_error && acc.status !== "active"
+    ? ` · <span class="gw-err" title="${esc(acc.last_error)}">${esc(acc.last_error.slice(0, 34))}${acc.last_error.length > 34 ? "…" : ""}</span>`
+    : "";
+  return `<span class="status-dot ${cls}"></span><span>${esc(t(GW_STATUS_KEY[acc.status] || "gw.status.active"))}${esc(cooling)}</span>${err}`;
+}
+
+function gwSlotHtml(acc, enabled) {
+  if (!enabled || !acc) return "";
+  return `<div class="row-gw-line">
+    ${gwStatusMeta(acc)}
+    <span class="gw-sep">·</span>
+    <span>${t("gw.remaining", { n: fmtNum(acc.remaining || 0) })}</span>
+    <span class="gw-sep">·</span>
+    <span>${t("gw.inflight", { n: acc.inflight })}</span>
+    <span class="gw-sep">·</span>
+    <span>${t("gw.okfail", { ok: acc.use_count, fail: acc.fail_count })}</span>
+  </div>`;
+}
+
+function gatewayPill(s) {
+  const running = gw?.running;
+  const endpoint = running ? `http://127.0.0.1:${gw.port}/v1` : "";
+  return `<span class="gw-pill${running ? " on" : ""}" role="group" aria-label="${t("gw.pillLabel")}">
+    <button class="tog-inline${s.gateway_enabled ? " on" : ""}"
+      role="switch" aria-checked="${s.gateway_enabled}"
+      title="${t("gw.pillToggleTitle")}"
+      click="actions.toggleGatewayMain()">
+      <span class="toggle${s.gateway_enabled ? " on" : ""}" aria-hidden="true"><span class="knob"></span></span>
+      ${t("gw.pillLabel")}
+    </button>${endpoint
+      ? `<button class="gw-endpoint" title="${t("gw.copied") === "" ? "" : t("gw.copyTip")}" click="actions.copyGwEndpoint('${endpoint}')">${esc(endpoint)}</button>`
+      : ""}</span>`;
+}
+
 function acctQuotaSlot(id) {
   const strip = claimStripHtml(id);
   const q = acctQuota[id];
@@ -744,6 +810,8 @@ function render() {
     return;
   }
   const s = state;
+  const gwById = {};
+  (gw?.accounts || []).forEach((r) => { gwById[r.id] = r; });
   const active = s.accounts.find((a) => a.is_active) || null;
   const unsaved = s.live_logged_in && !active;
 
@@ -798,6 +866,7 @@ function render() {
         </div>
       </div>
       ${acctQuotaSlot(a.id)}
+      ${gwSlotHtml(gwById[a.id], !!s.gateway_enabled)}
     </div>`;
   }).join("");
 
@@ -810,6 +879,9 @@ function render() {
     : rows;
 
   const claimableCount = s.accounts.filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
+  const accountIssues = (s.account_issues || []).map((issue) =>
+    `<li>${esc(issue.file)} — ${esc(issue.error)}</li>`
+  ).join("");
 
   $app.innerHTML = `
     <header class="topbar">
@@ -840,6 +912,8 @@ function render() {
               : esc(t("btn.refreshClaim"))}
           </button>`
         : ""}
+      <button class="btn-ghost has-ic" click="actions.backup()" title="${t("m.backupTitle")}">${ic("refresh", 16)} ${t("m.backup")}</button>
+      ${gatewayPill(s)}
       <button class="tog-inline${s.auto_claim ? " on" : ""}${autoClaimRunning ? " running" : ""}"
         role="switch" aria-checked="${s.auto_claim}" aria-label="${t("btn.autoClaim")}"
         title="${autoPillTitle(s)}"
@@ -854,6 +928,13 @@ function render() {
       <span class="tb-spacer"></span>
       <button class="btn-ghost tb-gear has-ic" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 16)}</button>
     </section>
+
+    ${accountIssues ? `
+      <div class="account-data-warning" role="alert">
+        <strong>${esc(t("m.accountDataWarning"))}</strong>
+        <ul>${accountIssues}</ul>
+      </div>` : ""}
+    ${s.backup_count === 0 ? `<div class="account-data-warning" role="status">${esc(t("m.noBackups"))}</div>` : ""}
 
     <div class="section-head">
       <h2>${t("m.accounts")}</h2>
@@ -982,6 +1063,7 @@ async function sweepTick() {
     sweepTick();
     setInterval(() => {
       invoke("get_state").then((s) => { state = s; if (s?.language) init(s.language); enrollAccounts(); if (!uiLocked()) render(); }).catch(() => {});
+      invoke("gateway_status").then((v) => { gw = v; if (!uiLocked()) render(); }).catch(() => {});
     }, 5000);
     setInterval(sweepTick, TICK_MS);
     setTimeout(autoClaimTick, AUTO_CLAIM_FIRST_DELAY_MS);

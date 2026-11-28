@@ -1,8 +1,8 @@
-
 use crate::i18n::{tr, trf};
 use crate::quota;
 use crate::zcrypto;
 use chrono::Local;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -35,16 +35,23 @@ fn detached(mut c: std::process::Command) -> std::process::Command {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     c.process_group(0);
-    c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    c.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     c
 }
 
+#[derive(Clone)]
 pub struct Paths {
     pub home: PathBuf,
     pub data_root: PathBuf,
 }
 
-pub(crate) fn pick_home(zswitch: Option<PathBuf>, userprofile: Option<PathBuf>, home_env: Option<PathBuf>) -> PathBuf {
+pub(crate) fn pick_home(
+    zswitch: Option<PathBuf>,
+    userprofile: Option<PathBuf>,
+    home_env: Option<PathBuf>,
+) -> PathBuf {
     zswitch
         .or(userprofile)
         .or(home_env)
@@ -65,7 +72,11 @@ fn bootstrap_data_base_dir(home: &Path) -> Option<PathBuf> {
     fs::read_to_string(home.join(".zcode").join("v2").join("setting.json"))
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.get("dataBaseDir").and_then(|d| d.as_str()).map(|s| s.trim().to_string()))
+        .and_then(|v| {
+            v.get("dataBaseDir")
+                .and_then(|d| d.as_str())
+                .map(|s| s.trim().to_string())
+        })
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .filter(|d| d.is_absolute())
@@ -95,19 +106,64 @@ impl Paths {
         Paths { home, data_root }
     }
 
-    pub fn store_dir(&self) -> PathBuf { self.home.join(".zcode-switch") }
-    pub fn accounts_dir(&self) -> PathBuf { self.store_dir().join("accounts") }
-    pub fn settings_file(&self) -> PathBuf { self.store_dir().join("settings.json") }
-    pub fn zcode_dir(&self) -> PathBuf { self.data_root.join(".zcode") }
-    pub fn live_file(&self) -> PathBuf { self.zcode_dir().join("v2").join("credentials.json") }
-    pub fn live_config(&self) -> PathBuf { self.zcode_dir().join("v2").join("config.json") }
-    pub fn live_telemetry(&self) -> PathBuf { self.zcode_dir().join("v2").join("telemetry-state.json") }
-    pub fn live_setting(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("setting.json") }
-    pub fn live_plan_cache(&self) -> PathBuf { self.zcode_dir().join("v2").join("coding-plan-cache.json") }
+    pub fn store_dir(&self) -> PathBuf {
+        self.home.join(".zcode-switch")
+    }
+    pub fn accounts_dir(&self) -> PathBuf {
+        self.store_dir().join("accounts")
+    }
+    pub fn settings_file(&self) -> PathBuf {
+        self.store_dir().join("settings.json")
+    }
+    pub fn zcode_dir(&self) -> PathBuf {
+        self.data_root.join(".zcode")
+    }
+    pub fn live_file(&self) -> PathBuf {
+        self.zcode_dir().join("v2").join("credentials.json")
+    }
+    pub fn live_config(&self) -> PathBuf {
+        self.zcode_dir().join("v2").join("config.json")
+    }
+    pub fn live_telemetry(&self) -> PathBuf {
+        self.zcode_dir().join("v2").join("telemetry-state.json")
+    }
+    pub fn live_setting(&self) -> PathBuf {
+        self.home.join(".zcode").join("v2").join("setting.json")
+    }
+    pub fn live_plan_cache(&self) -> PathBuf {
+        self.zcode_dir().join("v2").join("coding-plan-cache.json")
+    }
 
     pub fn ensure_dirs(&self) -> Result<(), String> {
-        fs::create_dir_all(self.accounts_dir()).map_err(|e| trf("err.store.mk_accounts_dir", &[("e", &e.to_string())]))?;
+        fs::create_dir_all(self.accounts_dir())
+            .map_err(|e| trf("err.store.mk_accounts_dir", &[("e", &e.to_string())]))?;
         Ok(())
+    }
+}
+
+pub struct StoreLock {
+    _file: fs::File,
+}
+
+impl StoreLock {
+    pub fn acquire(paths: &Paths) -> Result<Self, String> {
+        paths.ensure_dirs()?;
+        let lock_path = paths.store_dir().join("store.lock");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .map_err(|e| trf("err.store.list_fail", &[("e", &e.to_string())]))?;
+        file.lock_exclusive()
+            .map_err(|e| trf("err.store.list_fail", &[("e", &e.to_string())]))?;
+        Ok(Self { _file: file })
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
     }
 }
 
@@ -142,16 +198,44 @@ pub struct Settings {
     pub language: Option<String>,
     #[serde(default)]
     pub auto_claim: Option<bool>,
+    // 聚合网关（默认关；key 为空时网关拒绝一切请求）
+    #[serde(default)]
+    pub gateway_enabled: Option<bool>,
+    #[serde(default)]
+    pub gateway_port: Option<u16>,
+    #[serde(default)]
+    pub gateway_key: Option<String>,
+    #[serde(default)]
+    pub captcha_solver_python: Option<String>,
+    #[serde(default)]
+    pub captcha_solver_script: Option<String>,
 }
 
 impl Settings {
-    pub fn launch_after_switch(&self) -> bool { self.launch_after_switch.unwrap_or(true) }
-    pub fn close_to_tray(&self) -> bool { self.close_to_tray.unwrap_or(true) }
-    pub fn hot_switch(&self) -> bool { self.hot_switch.unwrap_or(false) }
-    pub fn auto_claim(&self) -> bool { self.auto_claim.unwrap_or(false) }
+    pub fn launch_after_switch(&self) -> bool {
+        self.launch_after_switch.unwrap_or(true)
+    }
+    pub fn close_to_tray(&self) -> bool {
+        self.close_to_tray.unwrap_or(true)
+    }
+    pub fn hot_switch(&self) -> bool {
+        self.hot_switch.unwrap_or(false)
+    }
+    pub fn auto_claim(&self) -> bool {
+        self.auto_claim.unwrap_or(false)
+    }
+    pub fn gateway_enabled(&self) -> bool {
+        self.gateway_enabled.unwrap_or(false)
+    }
+    pub fn gateway_port(&self) -> u16 {
+        self.gateway_port.unwrap_or(8718)
+    }
     pub fn auth_proxy(&self) -> Option<&str> {
         if self.auth_proxy_on.unwrap_or(false) {
-            self.auth_proxy_url.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            self.auth_proxy_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
         } else {
             None
         }
@@ -172,6 +256,12 @@ pub struct AccountSummary {
 }
 
 #[derive(Serialize, Clone, Debug)]
+pub struct AccountIssue {
+    pub file: String,
+    pub error: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
 pub struct AppState {
     pub zcode_running: bool,
     pub live_exists: bool,
@@ -180,6 +270,8 @@ pub struct AppState {
     pub active_account_id: Option<String>,
     pub live_identity: Option<zcrypto::Identity>,
     pub accounts: Vec<AccountSummary>,
+    pub account_issues: Vec<AccountIssue>,
+    pub backup_count: usize,
     pub zcode_path: String,
     pub zcode_path_ok: bool,
     pub store_dir: String,
@@ -190,6 +282,11 @@ pub struct AppState {
     pub auth_proxy_on: bool,
     pub auth_proxy_url: Option<String>,
     pub language: String,
+    pub gateway_enabled: bool,
+    pub gateway_port: u16,
+    pub gateway_key_set: bool,
+    pub captcha_solver_python: Option<String>,
+    pub captcha_solver_script: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -239,8 +336,14 @@ pub fn canonical_hash(v: &Value) -> String {
 }
 
 pub fn is_logged_in(v: &Value) -> bool {
-    let Some(map) = v.as_object() else { return false };
-    if map.keys().any(|k| k.starts_with("oauth:") && k.ends_with(":access_token")) {
+    let Some(map) = v.as_object() else {
+        return false;
+    };
+    if map.iter().any(|(k, value)| {
+        k.starts_with("oauth:")
+            && k.ends_with(":access_token")
+            && value.as_str().is_some_and(|token| !token.trim().is_empty())
+    }) {
         return true;
     }
     map.get("zcodejwttoken")
@@ -254,10 +357,18 @@ pub fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| trf("err.mkdir", &[("e", &e.to_string())]))?;
     }
     let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4().simple()));
-    fs::write(&tmp, data).map_err(|e| trf("err.write_file", &[("path", &path.display().to_string()), ("e", &e.to_string())]))?;
+    fs::write(&tmp, data).map_err(|e| {
+        trf(
+            "err.write_file",
+            &[("path", &path.display().to_string()), ("e", &e.to_string())],
+        )
+    })?;
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
-        return Err(trf("err.rename_fail", &[("path", &path.display().to_string()), ("e", &e.to_string())]));
+        return Err(trf(
+            "err.rename_fail",
+            &[("path", &path.display().to_string()), ("e", &e.to_string())],
+        ));
     }
     Ok(())
 }
@@ -266,10 +377,24 @@ pub fn read_live(paths: &Paths) -> Result<Option<Value>, String> {
     if !paths.live_file().exists() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(paths.live_file())
-        .map_err(|e| trf("err.read", &[("path", &paths.live_file().display().to_string()), ("e", &e.to_string())]))?;
-    let v: Value = serde_json::from_str(&raw)
-        .map_err(|e| trf("err.bad_json", &[("path", &paths.live_file().display().to_string()), ("e", &e.to_string())]))?;
+    let raw = fs::read_to_string(paths.live_file()).map_err(|e| {
+        trf(
+            "err.read",
+            &[
+                ("path", &paths.live_file().display().to_string()),
+                ("e", &e.to_string()),
+            ],
+        )
+    })?;
+    let v: Value = serde_json::from_str(&raw).map_err(|e| {
+        trf(
+            "err.bad_json",
+            &[
+                ("path", &paths.live_file().display().to_string()),
+                ("e", &e.to_string()),
+            ],
+        )
+    })?;
     if !v.is_object() {
         return Err(tr("err.store.not_object"));
     }
@@ -282,11 +407,19 @@ pub fn read_live_config(paths: &Paths) -> Option<Value> {
 }
 
 pub(crate) fn new_gen_provider_config(data_root: &Path) -> bool {
-    data_root.join(".zcode").join("v2").join("provider_config.json").exists()
+    data_root
+        .join(".zcode")
+        .join("v2")
+        .join("provider_config.json")
+        .exists()
 }
 
 fn snapshot_config_from_live(paths: &Paths) -> Option<Value> {
-    if new_gen_provider_config(&paths.data_root) { None } else { read_live_config(paths) }
+    if new_gen_provider_config(&paths.data_root) {
+        None
+    } else {
+        read_live_config(paths)
+    }
 }
 
 pub fn write_live(paths: &Paths, v: &Value) -> Result<(), String> {
@@ -306,6 +439,139 @@ pub(crate) fn in_sandbox() -> bool {
     std::env::var("ZCODE_SWITCH_HOME").is_ok()
 }
 
+// ---------- Linux 进程管理：/proc 直读 + kill(2)，不依赖 pgrep/pkill ----------
+// AppImage 的 AppRun 会把 PATH / LD_LIBRARY_PATH 改写成挂载点优先，外部
+// pgrep/pkill 是否可用取决于打包内容与桌面会话；直接读 /proc 并在进程内
+// 发信号没有这两个前提，且能精确拿到重启所需的启动命令行。
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct ZProc {
+    pid: i32,
+    comm: String,
+    argv: Vec<String>,
+}
+
+/// 重启 ZCode 时沿用的启动方式：命令行、工作目录、必要的环境变量。
+/// 例如 zcode-pro 的启动链路是
+/// `ELECTRON_RUN_AS_NODE=1 /opt/ZCode/zcode --no-warnings /usr/lib/zcode-pro/cli.mjs`，
+/// 直接用 `/opt/ZCode/zcode` 重启会丢掉注入层，必须原样还原。
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct LaunchSpec {
+    program: PathBuf,
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+    env: Vec<(String, String)>,
+}
+
+#[cfg(target_os = "linux")]
+static REMEMBERED_LAUNCH: std::sync::Mutex<Option<LaunchSpec>> = std::sync::Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+const LAUNCH_ENV_KEYS: &[&str] = &[
+    "ELECTRON_RUN_AS_NODE",
+    "ELECTRON_OZONE_PLATFORM_HINT",
+    "ZCODEPRO_ZCODE_PATH",
+    "ZCODE_DATA_BASE_DIR",
+    "NODE_OPTIONS",
+];
+
+#[cfg(target_os = "linux")]
+fn read_proc(pid: i32) -> Option<ZProc> {
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()?
+        .trim()
+        .to_string();
+    let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let argv: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).to_string())
+        .collect();
+    Some(ZProc { pid, comm, argv })
+}
+
+#[cfg(target_os = "linux")]
+fn zcode_procs() -> Vec<ZProc> {
+    let Ok(rd) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for ent in rd.flatten() {
+        let Some(pid) = ent.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        if let Some(p) = read_proc(pid) {
+            if p.comm == "zcode" || p.comm == "ZCode" {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn proc_launch_env(pid: i32) -> Vec<(String, String)> {
+    let Ok(raw) = fs::read(format!("/proc/{pid}/environ")) else {
+        return Vec::new();
+    };
+    raw.split(|b| *b == 0)
+        .filter_map(|kv| {
+            let s = String::from_utf8_lossy(kv);
+            let (k, v) = s.split_once('=')?;
+            LAUNCH_ENV_KEYS
+                .contains(&k)
+                .then(|| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// 记下当前 ZCode 的启动方式。优先带 `cli.mjs` 的包装器进程（zcode-pro 等），
+/// 其次任何带参数的 zcode 进程；GUI 主进程的 cmdline 只有 `ZCode`，单独用不了。
+#[cfg(target_os = "linux")]
+fn capture_launch_spec(procs: &[ZProc]) {
+    let mut ranked: Vec<&ZProc> = procs.iter().filter(|p| p.argv.len() > 1).collect();
+    ranked.sort_by_key(|p| {
+        let has_cli = p.argv.iter().any(|a| a.ends_with("cli.mjs"));
+        let has_node = p.argv.iter().any(|a| a == "--no-warnings");
+        std::cmp::Reverse((has_cli as u8) * 2 + (has_node as u8))
+    });
+    let Some(p) = ranked.first() else { return };
+    let program = PathBuf::from(&p.argv[0]);
+    if !program.exists() {
+        return;
+    }
+    let spec = LaunchSpec {
+        program,
+        args: p.argv[1..].to_vec(),
+        cwd: fs::read_link(format!("/proc/{}/cwd", p.pid)).ok(),
+        env: proc_launch_env(p.pid),
+    };
+    eprintln!(
+        "[zsw] 已记录 ZCode 启动方式：{} {:?}（重启时按此还原）",
+        spec.program.display(),
+        spec.args
+    );
+    if let Ok(mut g) = REMEMBERED_LAUNCH.lock() {
+        *g = Some(spec);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_no_zcode(limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if zcode_procs().is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 #[cfg(windows)]
 pub fn zcode_running() -> bool {
     if in_sandbox() {
@@ -322,7 +588,15 @@ pub fn zcode_running() -> bool {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn zcode_running() -> bool {
+    if in_sandbox() {
+        return false;
+    }
+    !zcode_procs().is_empty()
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub fn zcode_running() -> bool {
     if in_sandbox() {
         return false;
@@ -357,7 +631,49 @@ pub fn kill_zcode() -> Result<bool, String> {
     Ok(!zcode_running())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn kill_zcode() -> Result<bool, String> {
+    if in_sandbox() {
+        return Ok(true);
+    }
+    let procs = zcode_procs();
+    if procs.is_empty() {
+        return Ok(true);
+    }
+    capture_launch_spec(&procs);
+    for p in &procs {
+        unsafe {
+            libc::kill(p.pid, libc::SIGTERM);
+        }
+    }
+    if wait_no_zcode(Duration::from_secs(4)) {
+        return Ok(true);
+    }
+    let left = zcode_procs();
+    eprintln!(
+        "[zsw] SIGTERM 后仍有 {} 个 ZCode 进程，改发 SIGKILL：{:?}",
+        left.len(),
+        left.iter()
+            .map(|p| format!("{}:{}", p.pid, p.comm))
+            .collect::<Vec<_>>()
+    );
+    for p in &left {
+        unsafe {
+            libc::kill(p.pid, libc::SIGKILL);
+        }
+    }
+    if wait_no_zcode(Duration::from_secs(4)) {
+        return Ok(true);
+    }
+    let rest: Vec<String> = zcode_procs()
+        .iter()
+        .map(|p| format!("{}:{}", p.pid, p.comm))
+        .collect();
+    eprintln!("[zsw] SIGKILL 后 ZCode 仍在运行：{}", rest.join(", "));
+    Ok(false)
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub fn kill_zcode() -> Result<bool, String> {
     if in_sandbox() {
         return Ok(true);
@@ -390,15 +706,96 @@ pub fn kill_zcode() -> Result<bool, String> {
     Ok(!zcode_running())
 }
 
-pub fn launch_zcode(path: &str) -> Result<(), String> {
+/// 从 AppImage 里启动其它程序时，AppRun 注入的挂载点环境会一并继承：
+/// `LD_LIBRARY_PATH` 指向 AppImage 自带的 GTK/glib，`GTK_PATH`/`GDK_PIXBUF_MODULE_FILE`
+/// 也指向挂载点。ZCode 是 Electron + 系统库，带着这些变量启动会加载错版本库而
+/// 启动失败或白屏，因此 spawn 前按需剥离。
+#[cfg(unix)]
+fn sanitize_appimage_env(c: &mut Command) {
+    let appdir = std::env::var("APPDIR").ok().filter(|s| !s.is_empty());
+    if appdir.is_none() && std::env::var_os("APPIMAGE").is_none() {
+        return;
+    }
+    for key in [
+        "APPDIR",
+        "APPIMAGE",
+        "APPIMAGE_EXTRACT_AND_RUN",
+        "ARGV0",
+        "OWD",
+        "GTK_DATA_PREFIX",
+        "GTK_EXE_PREFIX",
+        "GTK_PATH",
+        "GTK_THEME",
+        "GTK_IM_MODULE_FILE",
+        "GDK_PIXBUF_MODULE_FILE",
+        "GIO_MODULE_DIR",
+        "GI_TYPELIB_PATH",
+        "GSETTINGS_SCHEMA_DIR",
+        "LD_LIBRARY_PATH",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "PERLLIB",
+        "QT_PLUGIN_PATH",
+        "GST_PLUGIN_SYSTEM_PATH",
+        "GST_PLUGIN_SYSTEM_PATH_1_0",
+    ] {
+        c.env_remove(key);
+    }
+    if let Some(dir) = appdir {
+        if let Ok(v) = std::env::var("XDG_DATA_DIRS") {
+            let kept: Vec<&str> = v
+                .split(':')
+                .filter(|p| !p.is_empty() && !p.starts_with(dir.as_str()))
+                .collect();
+            if kept.is_empty() {
+                c.env_remove("XDG_DATA_DIRS");
+            } else {
+                c.env("XDG_DATA_DIRS", kept.join(":"));
+            }
+        }
+    }
+}
+
+/// 启动 ZCode。设置里显式指定了路径就用它；否则优先沿用上次杀掉前记下的
+/// 启动方式（zcode-pro 等包装器的完整命令行 + 关键环境），保证切换后重启的
+/// 实例与用户平时点图标启动的一致。
+pub fn launch_zcode(paths: &Paths, fallback: &str) -> Result<(), String> {
     if in_sandbox() {
         return Ok(());
     }
-    let p = PathBuf::from(path);
-    if !p.exists() {
-        return Err(trf("err.zcode.missing", &[("path", path)]));
+    let explicit = load_settings(paths).zcode_path.is_some();
+    let mut program = PathBuf::from(fallback);
+    let mut args: Vec<String> = Vec::new();
+    let mut cwd: Option<PathBuf> = None;
+    let mut extra_env: Vec<(String, String)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    if !explicit {
+        if let Some(spec) = REMEMBERED_LAUNCH.lock().ok().and_then(|g| g.clone()) {
+            if spec.program.exists() {
+                program = spec.program;
+                args = spec.args;
+                cwd = spec.cwd;
+                extra_env = spec.env;
+            }
+        }
     }
-    detached(Command::new(&p))
+    if !program.exists() {
+        return Err(trf(
+            "err.zcode.missing",
+            &[("path", &program.display().to_string())],
+        ));
+    }
+    let mut cmd = Command::new(&program);
+    cmd.args(&args);
+    if let Some(dir) = cwd.filter(|d| d.is_dir()) {
+        cmd.current_dir(dir);
+    }
+    for (k, v) in &extra_env {
+        cmd.env(k, v);
+    }
+    #[cfg(unix)]
+    sanitize_appimage_env(&mut cmd);
+    detached(cmd)
         .spawn()
         .map_err(|e| trf("err.zcode.launch", &[("e", &e.to_string())]))?;
     Ok(())
@@ -453,7 +850,10 @@ pub fn client_path_candidates(os: &str) -> Vec<String> {
     match os {
         "macos" => vec![
             "/Applications/ZCode.app/Contents/MacOS/ZCode".to_string(),
-            format!("{}/Applications/ZCode.app/Contents/MacOS/ZCode", std::env::var("HOME").unwrap_or_default()),
+            format!(
+                "{}/Applications/ZCode.app/Contents/MacOS/ZCode",
+                std::env::var("HOME").unwrap_or_default()
+            ),
             "/usr/local/bin/zcode".to_string(),
         ],
         "windows" => vec![
@@ -466,7 +866,10 @@ pub fn client_path_candidates(os: &str) -> Vec<String> {
             "/usr/local/bin/zcode".to_string(),
             "/usr/bin/zcode".to_string(),
             "/opt/ZCode/zcode".to_string(),
-            format!("{}/.local/bin/zcode", std::env::var("HOME").unwrap_or_default()),
+            format!(
+                "{}/.local/bin/zcode",
+                std::env::var("HOME").unwrap_or_default()
+            ),
         ],
     }
 }
@@ -475,7 +878,8 @@ pub fn normalize_zcode_path(raw: &str) -> Option<String> {
     let mut t = raw.trim();
     if t.len() >= 2 {
         let b = t.as_bytes();
-        let quoted = (b[0] == b'"' && b[t.len() - 1] == b'"') || (b[0] == b'\'' && b[t.len() - 1] == b'\'');
+        let quoted =
+            (b[0] == b'"' && b[t.len() - 1] == b'"') || (b[0] == b'\'' && b[t.len() - 1] == b'\'');
         if quoted {
             t = t[1..t.len() - 1].trim();
         }
@@ -509,7 +913,9 @@ pub fn list_accounts(paths: &Paths) -> Result<Vec<Account>, String> {
         return Ok(vec![]);
     }
     let mut out = vec![];
-    for entry in fs::read_dir(&dir).map_err(|e| trf("err.store.list_fail", &[("e", &e.to_string())]))? {
+    for entry in
+        fs::read_dir(&dir).map_err(|e| trf("err.store.list_fail", &[("e", &e.to_string())]))?
+    {
         let entry = entry.map_err(|e| trf("err.store.list_fail", &[("e", &e.to_string())]))?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -526,6 +932,294 @@ pub fn list_accounts(paths: &Paths) -> Result<Vec<Account>, String> {
     Ok(out)
 }
 
+pub fn list_account_issues(paths: &Paths) -> Vec<AccountIssue> {
+    let dir = paths.accounts_dir();
+    let mut issues = vec![];
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return issues;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let result = fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| serde_json::from_str::<Account>(&raw).map_err(|e| e.to_string()));
+        if let Err(error) = result {
+            issues.push(AccountIssue {
+                file: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                error,
+            });
+        }
+    }
+    issues.sort_by(|a, b| a.file.cmp(&b.file));
+    issues
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct BackupInfo {
+    pub name: String,
+    pub created_at: String,
+    pub account_count: usize,
+}
+
+pub fn create_account_backup(paths: &Paths) -> Result<BackupInfo, String> {
+    paths.ensure_dirs()?;
+    let backups_dir = paths.store_dir().join("backups");
+    fs::create_dir_all(&backups_dir).map_err(|e| trf("err.mkdir", &[("e", &e.to_string())]))?;
+    let name = format!("backup-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f"));
+    let backup_dir = backups_dir.join(&name);
+    fs::create_dir_all(&backup_dir).map_err(|e| trf("err.mkdir", &[("e", &e.to_string())]))?;
+    let mut account_count = 0;
+    for entry in fs::read_dir(paths.accounts_dir()).unwrap_or_else(|_| fs::read_dir(".").unwrap()) {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            fs::copy(&path, backup_dir.join(path.file_name().unwrap_or_default())).map_err(
+                |e| {
+                    trf(
+                        "err.write_file",
+                        &[
+                            ("path", &backup_dir.display().to_string()),
+                            ("e", &e.to_string()),
+                        ],
+                    )
+                },
+            )?;
+            account_count += 1;
+        }
+    }
+    let mut backups: Vec<_> = fs::read_dir(&backups_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    backups.sort_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
+    if backups.len() > 10 {
+        for old in backups.iter().take(backups.len() - 10) {
+            let _ = fs::remove_dir_all(old.path());
+        }
+    }
+    Ok(BackupInfo {
+        name,
+        created_at: now_ts(),
+        account_count,
+    })
+}
+
+pub fn list_account_backups(paths: &Paths) -> Vec<BackupInfo> {
+    let backups_dir = paths.store_dir().join("backups");
+    let mut out = vec![];
+    let Ok(entries) = fs::read_dir(backups_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let account_count = fs::read_dir(&path)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|v| v.to_str()) == Some("json"))
+            .count();
+        out.push(BackupInfo {
+            name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            created_at: entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|t| {
+                    chrono::DateTime::<chrono::Utc>::from(t)
+                        .format("%Y-%m-%d %H:%M")
+                        .to_string()
+                })
+                .unwrap_or_default(),
+            account_count,
+        });
+    }
+    out.sort_by(|a, b| b.name.cmp(&a.name));
+    out
+}
+
+pub fn restore_account_backup(paths: &Paths, backup_name: &str) -> Result<usize, String> {
+    if !backup_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(tr("err.store.bad_id"));
+    }
+    let backup_dir = paths.store_dir().join("backups").join(backup_name);
+    if !backup_dir.is_dir() {
+        return Err(tr("err.store.no_account_id"));
+    }
+    paths.ensure_dirs()?;
+    let mut restored = 0;
+    for entry in fs::read_dir(&backup_dir)
+        .map_err(|e| trf("err.store.list_fail", &[("e", &e.to_string())]))?
+    {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let file_name = path.file_name().unwrap_or_default();
+        let raw = fs::read_to_string(&path).map_err(|e| {
+            trf(
+                "err.read",
+                &[("path", &path.display().to_string()), ("e", &e.to_string())],
+            )
+        })?;
+        let _: Account = serde_json::from_str(&raw)
+            .map_err(|e| trf("err.store.corrupt", &[("e", &e.to_string())]))?;
+        fs::copy(&path, paths.accounts_dir().join(file_name)).map_err(|e| {
+            trf(
+                "err.write_file",
+                &[
+                    ("path", &paths.accounts_dir().display().to_string()),
+                    ("e", &e.to_string()),
+                ],
+            )
+        })?;
+        restored += 1;
+    }
+    Ok(restored)
+}
+
+pub fn append_operation_audit(paths: &Paths, operation: &str, detail: &Value) {
+    let _ = fs::create_dir_all(paths.store_dir());
+    let audit_path = paths.store_dir().join("operations.jsonl");
+    let line = serde_json::to_string(&json!({
+        "at": now_ts(),
+        "operation": operation,
+        "detail": detail,
+    }))
+    .unwrap_or_default();
+    use std::io::Write;
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(audit_path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+pub fn record_quota_snapshot(paths: &Paths, account_id: &str, overview: &Value) {
+    let _ = fs::create_dir_all(paths.store_dir());
+    let history_path = paths.store_dir().join("quota-history.jsonl");
+    let line = serde_json::to_string(&json!({
+        "at": now_ts(),
+        "account_id": account_id,
+        "overview": overview,
+    }))
+    .unwrap_or_default();
+    use std::io::Write;
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(history_path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SwitchTransaction {
+    pub id: String,
+    pub target_id: String,
+    pub status: String,
+    pub started_at: String,
+    pub live_credentials: Option<Value>,
+    pub live_config: Option<Value>,
+}
+
+pub fn begin_switch_transaction(
+    paths: &Paths,
+    target_id: &str,
+) -> Result<SwitchTransaction, String> {
+    let tx_dir = paths.store_dir().join("transactions");
+    fs::create_dir_all(&tx_dir).map_err(|e| trf("err.mkdir", &[("e", &e.to_string())]))?;
+    let tx = SwitchTransaction {
+        id: Uuid::new_v4().to_string(),
+        target_id: target_id.to_string(),
+        status: "started".to_string(),
+        started_at: now_ts(),
+        live_credentials: fs::read_to_string(paths.live_file())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok()),
+        live_config: fs::read_to_string(paths.live_config())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok()),
+    };
+    let body = serde_json::to_string_pretty(&tx).unwrap_or_default();
+    atomic_write(&tx_dir.join(format!("{}.json", tx.id)), &(body + "\n"))?;
+    Ok(tx)
+}
+
+pub fn finish_switch_transaction(paths: &Paths, tx: &SwitchTransaction, status: &str) {
+    let mut finished = tx.clone();
+    finished.status = status.to_string();
+    let path = paths
+        .store_dir()
+        .join("transactions")
+        .join(format!("{}.json", tx.id));
+    if let Ok(body) = serde_json::to_string_pretty(&finished) {
+        let _ = atomic_write(&path, &(body + "\n"));
+    }
+}
+
+pub fn recover_pending_switch_transactions(paths: &Paths) -> Vec<String> {
+    let tx_dir = paths.store_dir().join("transactions");
+    let mut recovered = vec![];
+    let Ok(entries) = fs::read_dir(tx_dir) else {
+        return recovered;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(tx) = serde_json::from_str::<SwitchTransaction>(&raw) else {
+            continue;
+        };
+        if tx.status != "started" {
+            continue;
+        }
+        if let Some(creds) = tx.live_credentials.as_ref() {
+            let body = serde_json::to_string_pretty(&creds).unwrap_or_default();
+            let _ = atomic_write(&paths.live_file(), &(body + "\n"));
+        } else {
+            let _ = fs::remove_file(paths.live_file());
+        }
+        if let Some(cfg) = tx.live_config.as_ref() {
+            let body = serde_json::to_string_pretty(&cfg).unwrap_or_default();
+            let _ = atomic_write(&paths.live_config(), &(body + "\n"));
+        } else {
+            let _ = fs::remove_file(paths.live_config());
+        }
+        finish_switch_transaction(paths, &tx, "recovered");
+        recovered.push(tx.id.clone());
+    }
+    recovered
+}
+
 pub fn save_account(paths: &Paths, acc: &Account) -> Result<(), String> {
     paths.ensure_dirs()?;
     let path = paths.accounts_dir().join(format!("{}.json", acc.id));
@@ -538,8 +1232,10 @@ pub fn load_account(paths: &Paths, id: &str) -> Result<Account, String> {
         return Err(tr("err.store.bad_id"));
     }
     let path = paths.accounts_dir().join(format!("{id}.json"));
-    let raw = fs::read_to_string(&path).map_err(|_| trf("err.store.no_account_id", &[("id", id)]))?;
-    let mut a: Account = serde_json::from_str(&raw).map_err(|e| trf("err.store.corrupt", &[("e", &e.to_string())]))?;
+    let raw =
+        fs::read_to_string(&path).map_err(|_| trf("err.store.no_account_id", &[("id", id)]))?;
+    let mut a: Account = serde_json::from_str(&raw)
+        .map_err(|e| trf("err.store.corrupt", &[("e", &e.to_string())]))?;
     migrate_account_hash_inplace(&mut a);
     Ok(a)
 }
@@ -600,10 +1296,16 @@ pub fn capture_current(paths: &Paths, name: Option<String>) -> Result<Account, S
     };
     adopt_virtual_device_mid(paths, &mut acc)?;
     adopt_virtual_arms_uid(paths, &mut acc)?;
+    save_account(paths, &acc)?;
     Ok(acc)
 }
 
-pub(crate) fn find_same_login(live: &Value, live_hash: &str, accounts: &[Account], home: &Path) -> Option<usize> {
+pub(crate) fn find_same_login(
+    live: &Value,
+    live_hash: &str,
+    accounts: &[Account],
+    home: &Path,
+) -> Option<usize> {
     if let Some(i) = accounts.iter().position(|a| a.hash == live_hash) {
         return Some(i);
     }
@@ -611,12 +1313,16 @@ pub(crate) fn find_same_login(live: &Value, live_hash: &str, accounts: &[Account
     if !identity_has_signal(&live_id) {
         return None;
     }
-    accounts.iter().position(|a| {
-        identity_matches(&live_id, &zcrypto::account_identity(&a.credentials, home))
-    })
+    accounts
+        .iter()
+        .position(|a| identity_matches(&live_id, &zcrypto::account_identity(&a.credentials, home)))
 }
 
-fn auto_preserve(paths: &Paths, accounts: &[Account], target_hash: &str) -> Result<Option<String>, String> {
+fn auto_preserve(
+    paths: &Paths,
+    accounts: &[Account],
+    target_hash: &str,
+) -> Result<Option<String>, String> {
     let live = match read_live(paths)? {
         Some(v) if is_logged_in(&v) => v,
         _ => return Ok(None),
@@ -628,7 +1334,10 @@ fn auto_preserve(paths: &Paths, accounts: &[Account], target_hash: &str) -> Resu
     if find_same_login(&live, &hash, accounts, &paths.home).is_some() {
         return Ok(None);
     }
-    let name = unique_name(accounts, &format!("Auto {}", Local::now().format("%m-%d %H%M")));
+    let name = unique_name(
+        accounts,
+        &format!("Auto {}", Local::now().format("%m-%d %H%M")),
+    );
     let ts = now_ts();
     let mut acc = Account {
         id: Uuid::new_v4().to_string(),
@@ -655,28 +1364,55 @@ fn cred_plain(creds: &Value, key: &str, home: &std::path::Path) -> Option<String
     }
 }
 
+/// 网关用：读取凭据字段（enc:v1 自动解密）
+pub(crate) fn cred_plain_opt(creds: &Value, key: &str, home: &std::path::Path) -> Option<String> {
+    cred_plain(creds, key, home)
+}
+
 pub(crate) const JWT_CLOCK_SKEW_MS: i64 = 30_000;
 
 pub(crate) fn account_jwt_expired(creds: &Value, home: &Path) -> bool {
-    let Some(jwt) = cred_plain(creds, "zcodejwttoken", home) else { return false };
-    let Some(exp) = zcrypto::jwt_exp_ms(&jwt) else { return false };
+    let Some(jwt) = cred_plain(creds, "zcodejwttoken", home) else {
+        return false;
+    };
+    let Some(exp) = zcrypto::jwt_exp_ms(&jwt) else {
+        return false;
+    };
     let now_ms = Local::now().timestamp_millis();
     exp <= now_ms + JWT_CLOCK_SKEW_MS
 }
 
 fn sync_live_back_to_source(paths: &Paths, accounts: &[Account]) -> Result<(), String> {
-    let Some(live) = read_live(paths)? else { return Ok(()) };
-    if !is_logged_in(&live) { return Ok(()); }
+    let Some(live) = read_live(paths)? else {
+        return Ok(());
+    };
+    if !is_logged_in(&live) {
+        return Ok(());
+    }
     let live_hash = canonical_hash(&live);
     let live_id = zcrypto::account_identity(&live, &paths.home);
     let has_id = identity_has_signal(&live_id);
-    let source = accounts.iter().find(|a| a.hash == live_hash).cloned().or_else(|| {
-        if !has_id { return None; }
-        accounts.iter().find(|a| {
-            identity_matches(&live_id, &zcrypto::account_identity(&a.credentials, &paths.home))
-        }).cloned()
-    });
-    let Some(mut src) = source else { return Ok(()); };
+    let source = accounts
+        .iter()
+        .find(|a| a.hash == live_hash)
+        .cloned()
+        .or_else(|| {
+            if !has_id {
+                return None;
+            }
+            accounts
+                .iter()
+                .find(|a| {
+                    identity_matches(
+                        &live_id,
+                        &zcrypto::account_identity(&a.credentials, &paths.home),
+                    )
+                })
+                .cloned()
+        });
+    let Some(mut src) = source else {
+        return Ok(());
+    };
     let mut changed = false;
     if src.credentials != live {
         src.credentials = live.clone();
@@ -708,13 +1444,20 @@ fn reset_live_plan_cache(paths: &Paths) {
 
 fn align_family_domain(paths: &Paths, target: &Account) {
     let Some(provider) = cred_plain(&target.credentials, "oauth:active_provider", &paths.home)
-        .filter(|p| p == "bigmodel" || p == "zai") else { return; };
-    let Ok(raw) = fs::read_to_string(paths.live_setting()) else { return; };
+        .filter(|p| p == "bigmodel" || p == "zai")
+    else {
+        return;
+    };
+    let Ok(raw) = fs::read_to_string(paths.live_setting()) else {
+        return;
+    };
     let Ok(mut v) = serde_json::from_str::<Value>(&raw) else {
         eprintln!("setting.json 解析失败,跳过 family domain 对齐");
         return;
     };
-    let Some(obj) = v.as_object_mut() else { return; };
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
     let now_ms = chrono::Local::now().timestamp_millis();
     obj.insert("providerFamilyDomain".into(), Value::String(provider));
     obj.insert("providerFamilyDomainUpdatedAt".into(), Value::from(now_ms));
@@ -725,17 +1468,33 @@ fn align_family_domain(paths: &Paths, target: &Account) {
 }
 
 fn rematerialize_wiped_builtins(paths: &Paths, target: &Account) {
-    if target.config.is_none() { return; }
+    if target.config.is_none() {
+        return;
+    }
     let Some(provider) = cred_plain(&target.credentials, "oauth:active_provider", &paths.home)
-        .filter(|p| p == "bigmodel" || p == "zai") else { return; };
+        .filter(|p| p == "bigmodel" || p == "zai")
+    else {
+        return;
+    };
     let Some(jwt) = cred_plain(&target.credentials, "zcodejwttoken", &paths.home)
-        .filter(|j| !j.trim().is_empty()) else { return; };
-    let Some(live) = read_live_config(paths) else { return; };
-    let mut out = match live.as_object() { Some(o) => o.clone(), None => return };
-    let Some(live_prov) = out.get("provider").and_then(|v| v.as_object()) else { return };
+        .filter(|j| !j.trim().is_empty())
+    else {
+        return;
+    };
+    let Some(live) = read_live_config(paths) else {
+        return;
+    };
+    let mut out = match live.as_object() {
+        Some(o) => o.clone(),
+        None => return,
+    };
+    let Some(live_prov) = out.get("provider").and_then(|v| v.as_object()) else {
+        return;
+    };
 
     let wiped = |cur: &Value| {
-        cur.get("options").and_then(|o| o.get("apiKey"))
+        cur.get("options")
+            .and_then(|o| o.get("apiKey"))
             .map(|k| k.as_str().map(str::trim).unwrap_or("").is_empty())
             .unwrap_or(true)
             || (cur.get("enabled").and_then(|e| e.as_bool()) == Some(false)
@@ -749,10 +1508,15 @@ fn rematerialize_wiped_builtins(paths: &Paths, target: &Account) {
     let has_candidate = live_prov
         .iter()
         .any(|(id, cur)| id.starts_with(&family_prefix) && wiped(cur));
-    if !has_candidate { return; }
+    if !has_candidate {
+        return;
+    }
 
     let at_key = format!("oauth:{provider}:access_token");
-    let access_token = match (in_sandbox(), cred_plain(&target.credentials, &at_key, &paths.home)) {
+    let access_token = match (
+        in_sandbox(),
+        cred_plain(&target.credentials, &at_key, &paths.home),
+    ) {
         (true, _) => String::new(),
         (false, Some(at)) => at.trim().to_string(),
         (false, None) => String::new(),
@@ -763,15 +1527,26 @@ fn rematerialize_wiped_builtins(paths: &Paths, target: &Account) {
         access_token
     };
     let fresh = crate::oauth::assemble_config(&provider, &jwt, &access_token);
-    let Some(fresh_map) = fresh.get("provider").and_then(|v| v.as_object()) else { return; };
+    let Some(fresh_map) = fresh.get("provider").and_then(|v| v.as_object()) else {
+        return;
+    };
     let mut live_prov = live_prov.clone();
     let mut changed = false;
     for (id, fresh_entry) in fresh_map {
-        let Some(cur) = live_prov.get(id) else { continue; };
-        if !wiped(cur) { continue; }
-        let Some(new_key) = fresh_entry.pointer("/options/apiKey")
-            .and_then(|k| k.as_str()).map(str::trim)
-            .filter(|k| !k.is_empty()) else { continue; };
+        let Some(cur) = live_prov.get(id) else {
+            continue;
+        };
+        if !wiped(cur) {
+            continue;
+        }
+        let Some(new_key) = fresh_entry
+            .pointer("/options/apiKey")
+            .and_then(|k| k.as_str())
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        else {
+            continue;
+        };
         let mut patched = cur.clone();
         if let Some(opts) = patched.get_mut("options").and_then(|o| o.as_object_mut()) {
             opts.insert("apiKey".into(), Value::String(new_key.to_string()));
@@ -793,7 +1568,11 @@ fn rematerialize_wiped_builtins(paths: &Paths, target: &Account) {
     }
 }
 
-fn run_switch_probe(paths: &Paths, target: &Account, mid: Option<String>) -> Option<crate::probe::ProbeOutcome> {
+fn run_switch_probe(
+    paths: &Paths,
+    target: &Account,
+    mid: Option<String>,
+) -> Option<crate::probe::ProbeOutcome> {
     if in_sandbox() || !is_logged_in(&target.credentials) {
         return None;
     }
@@ -808,12 +1587,23 @@ fn run_switch_probe(paths: &Paths, target: &Account, mid: Option<String>) -> Opt
 }
 
 fn probe_config_base(paths: &Paths, target: &Account) -> Option<Value> {
-    if target.config.is_none() { return None; }
-    if new_gen_provider_config(&paths.data_root) { target.config.clone() }
-    else { read_live_config(paths).or_else(|| target.config.clone()) }
+    if target.config.is_none() {
+        return None;
+    }
+    if new_gen_provider_config(&paths.data_root) {
+        target.config.clone()
+    } else {
+        read_live_config(paths).or_else(|| target.config.clone())
+    }
 }
 
-pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool) -> Result<SwitchResult, String> {
+pub fn switch_to(
+    paths: &Paths,
+    id: &str,
+    force: bool,
+    restart: bool,
+    hot: bool,
+) -> Result<SwitchResult, String> {
     let target = load_account(paths, id)?;
     let accounts = list_accounts(paths)?;
     let live = read_live(paths)?;
@@ -855,6 +1645,8 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
     }
 
     let running = zcode_running();
+    let tx = begin_switch_transaction(paths, id)?;
+    let _ = create_account_backup(paths);
     if hot && running {
         if let Err(e) = sync_live_back_to_source(paths, &accounts) {
             eprintln!("sync-back 失败(不阻断切换): {e}");
@@ -862,13 +1654,22 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         let accounts = list_accounts(paths)?;
         let preserved_as = auto_preserve(paths, &accounts, &target.hash)?;
         let creds = inject_relay_pass_hash(&target.credentials, current_relay_pass(paths).as_ref());
-        hot_swap_verified(paths, &target, &creds)?;
+        if let Err(e) = hot_swap_verified(paths, &target, &creds) {
+            finish_switch_transaction(paths, &tx, "failed");
+            return Err(e);
+        }
         backfill_relay_pass_hash(paths, &target.id, &creds);
         reset_live_plan_cache(paths);
         let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
         write_live_device_mid(paths, &mid)?;
         ensure_virtual_arms_uid_locked(paths, &target.id)?;
         let probe = run_switch_probe(paths, &target, Some(mid));
+        finish_switch_transaction(paths, &tx, "completed");
+        append_operation_audit(
+            paths,
+            "switch",
+            &json!({"id": id, "name": target.name, "hot": true}),
+        );
         return Ok(SwitchResult {
             switched: true,
             already_active: false,
@@ -901,7 +1702,18 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
     let preserved_as = auto_preserve(paths, &accounts, &target.hash)?;
 
     let creds = inject_relay_pass_hash(&target.credentials, current_relay_pass(paths).as_ref());
-    write_live(paths, &creds)?;
+    let live_snapshot = fs::read(paths.live_file()).ok();
+    let config_snapshot = fs::read(paths.live_config()).ok();
+    if let Err(e) = write_live(paths, &creds) {
+        finish_switch_transaction(paths, &tx, "failed");
+        if let Some(body) = live_snapshot.as_ref() {
+            let _ = fs::write(paths.live_file(), body);
+        }
+        if let Some(body) = config_snapshot.as_ref() {
+            let _ = fs::write(paths.live_config(), body);
+        }
+        return Err(e);
+    }
     backfill_relay_pass_hash(paths, &target.id, &creds);
     let new_gen = new_gen_provider_config(&paths.data_root);
     if new_gen {
@@ -912,7 +1724,20 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
     }
     if let Some(cfg) = &target.config {
         if !new_gen {
-            write_live_config(paths, cfg)?;
+            if let Err(e) = write_live_config(paths, cfg) {
+                finish_switch_transaction(paths, &tx, "failed");
+                if let Some(body) = live_snapshot.as_ref() {
+                    let _ = fs::write(paths.live_file(), body);
+                } else {
+                    let _ = fs::remove_file(paths.live_file());
+                }
+                if let Some(body) = config_snapshot.as_ref() {
+                    let _ = fs::write(paths.live_config(), body);
+                } else {
+                    let _ = fs::remove_file(paths.live_config());
+                }
+                return Err(e);
+            }
         }
     }
     reset_live_plan_cache(paths);
@@ -928,12 +1753,18 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
     let mut launched = false;
     if restart {
         let (p, ok) = effective_zcode_path(paths);
-        if ok && launch_zcode(&p).is_ok() {
+        if ok && launch_zcode(paths, &p).is_ok() {
             launched = true;
         }
     }
 
     let probe = run_switch_probe(paths, &target, Some(mid));
+    finish_switch_transaction(paths, &tx, "completed");
+    append_operation_audit(
+        paths,
+        "switch",
+        &json!({"id": id, "name": target.name, "hot": false}),
+    );
 
     Ok(SwitchResult {
         switched: true,
@@ -951,7 +1782,9 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
 const RELAY_PASS_KEY: &str = "web-remote-control:external-relay:pass_hash";
 
 fn inject_relay_pass_hash(creds: &Value, relay: Option<&Value>) -> Value {
-    let Some(relay) = relay else { return creds.clone() };
+    let Some(relay) = relay else {
+        return creds.clone();
+    };
     let mut out = creds.clone();
     if let Some(map) = out.as_object_mut() {
         map.insert(RELAY_PASS_KEY.to_string(), relay.clone());
@@ -967,7 +1800,9 @@ fn current_relay_pass(paths: &Paths) -> Option<Value> {
 }
 
 fn backfill_relay_pass_hash(paths: &Paths, target_id: &str, creds: &Value) {
-    let Ok(mut acc) = load_account(paths, target_id) else { return };
+    let Ok(mut acc) = load_account(paths, target_id) else {
+        return;
+    };
     if acc.credentials != *creds {
         acc.credentials = creds.clone();
         acc.updated_at = now_ts();
@@ -988,7 +1823,11 @@ fn hot_swap_verified(paths: &Paths, target: &Account, creds: &Value) -> Result<(
         }
     };
     let mut last_err: Option<String> = None;
-    let backoff = |attempt: u32| std::thread::sleep(std::time::Duration::from_millis(250 + u64::from(attempt) * 250));
+    let backoff = |attempt: u32| {
+        std::thread::sleep(std::time::Duration::from_millis(
+            250 + u64::from(attempt) * 250,
+        ))
+    };
     for attempt in 0..3u32 {
         if let Err(e) = write_live(paths, creds) {
             last_err = Some(trf("err.write", &[("e", &e)]));
@@ -1028,8 +1867,18 @@ fn identity_has_signal(id: &zcrypto::Identity) -> bool {
 fn identity_matches(a: &zcrypto::Identity, b: &zcrypto::Identity) -> bool {
     let norm = |s: &str| s.trim().to_lowercase();
     let opt = |s: &Option<String>| norm(s.as_deref().unwrap_or("")).to_string();
-    let (au, ae, ap, an) = (opt(&a.user_id), opt(&a.email), norm(&a.provider), opt(&a.username));
-    let (bu, be, bp, bn) = (opt(&b.user_id), opt(&b.email), norm(&b.provider), opt(&b.username));
+    let (au, ae, ap, an) = (
+        opt(&a.user_id),
+        opt(&a.email),
+        norm(&a.provider),
+        opt(&a.username),
+    );
+    let (bu, be, bp, bn) = (
+        opt(&b.user_id),
+        opt(&b.email),
+        norm(&b.provider),
+        opt(&b.username),
+    );
     if !au.is_empty() && !bu.is_empty() {
         if au != bu {
             return false;
@@ -1059,7 +1908,10 @@ pub fn rename_account(paths: &Paths, id: &str, new_name: &str) -> Result<Account
         .iter()
         .find(|a| a.id != id && a.name.eq_ignore_ascii_case(name))
     {
-        return Err(trf("err.name.taken", &[("name", name), ("other", &other.name)]));
+        return Err(trf(
+            "err.name.taken",
+            &[("name", name), ("other", &other.name)],
+        ));
     }
     acc.name = name.to_string();
     acc.updated_at = now_ts();
@@ -1102,7 +1954,11 @@ pub fn update_account_from_live(paths: &Paths, id: &str) -> Result<Account, Stri
 }
 
 fn live_quota_config(paths: &Paths) -> Option<Value> {
-    if new_gen_provider_config(&paths.data_root) { None } else { read_live_config(paths) }
+    if new_gen_provider_config(&paths.data_root) {
+        None
+    } else {
+        read_live_config(paths)
+    }
 }
 
 pub fn live_quota(paths: &Paths) -> Result<quota::QuotaOverview, String> {
@@ -1164,21 +2020,35 @@ pub fn write_live_device_mid(paths: &Paths, mid: &str) -> Result<(), String> {
         return Ok(());
     }
     v["deviceMid"] = json!(mid);
-    atomic_write(&paths.live_telemetry(), &(serde_json::to_string(&v).unwrap_or_default() + "\n"))
+    atomic_write(
+        &paths.live_telemetry(),
+        &(serde_json::to_string(&v).unwrap_or_default() + "\n"),
+    )
 }
 
 fn adopt_virtual_device_mid(paths: &Paths, acc: &mut Account) -> Result<(), String> {
-    if acc.virtual_device_mid.as_deref().map_or(false, |m| !m.trim().is_empty()) {
+    if acc
+        .virtual_device_mid
+        .as_deref()
+        .map_or(false, |m| !m.trim().is_empty())
+    {
         return Ok(());
     }
     let live_mid: Option<String> = fs::read_to_string(paths.live_telemetry())
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v.get("deviceMid").and_then(|m| m.as_str()).map(String::from))
+        .and_then(|v| {
+            v.get("deviceMid")
+                .and_then(|m| m.as_str())
+                .map(String::from)
+        })
         .filter(|m| !m.trim().is_empty());
     let taken = |m: &str| {
         list_accounts(paths)
-            .map(|accs| accs.iter().any(|a| a.virtual_device_mid.as_deref() == Some(m)))
+            .map(|accs| {
+                accs.iter()
+                    .any(|a| a.virtual_device_mid.as_deref() == Some(m))
+            })
             .unwrap_or(false)
     };
     let mid = match live_mid {
@@ -1195,7 +2065,8 @@ const ARMS_DEFAULT_STORE_FILE: &str = "ZGVmYXVsdA.json";
 pub fn new_arms_uid() -> String {
     const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let uuid = Uuid::new_v4();
-    let suffix: String = uuid.as_bytes()
+    let suffix: String = uuid
+        .as_bytes()
         .iter()
         .take(16)
         .map(|b| ALPHABET[(*b as usize) % 36] as char)
@@ -1211,14 +2082,23 @@ fn arms_store_dirs_from(
     let mut out: Vec<PathBuf> = Vec::new();
     let mut push_if_new = |dir: PathBuf| {
         let lowered = dir.to_string_lossy().to_lowercase();
-        if !out.iter().any(|d| d.to_string_lossy().to_lowercase() == lowered) {
+        if !out
+            .iter()
+            .any(|d| d.to_string_lossy().to_lowercase() == lowered)
+        {
             out.push(dir);
         }
     };
     let mut candidates: Vec<PathBuf> = Vec::new();
     let groups: [(Option<PathBuf>, &[&str]); 3] = [
-        (win_appdata, &["ZCode", "zcode", "ZCode Preview", "ZCode Dev"]),
-        (mac_appsupport, &["ZCode", "zcode", "ZCode Preview", "ZCode Dev"]),
+        (
+            win_appdata,
+            &["ZCode", "zcode", "ZCode Preview", "ZCode Dev"],
+        ),
+        (
+            mac_appsupport,
+            &["ZCode", "zcode", "ZCode Preview", "ZCode Dev"],
+        ),
         (unix_base, &["zcode", "ZCode"]),
     ];
     for (base, names) in groups {
@@ -1272,7 +2152,11 @@ fn arms_store_dirs_for(paths: &Paths) -> Vec<PathBuf> {
         std::env::var("XDG_CONFIG_HOME")
             .ok()
             .map(PathBuf::from)
-            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config"))),
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".config"))
+            }),
     );
     arms_store_dirs_from(appdata, mac_base, unix_base)
 }
@@ -1304,7 +2188,11 @@ fn read_live_arms_uid_from(dirs: &[PathBuf]) -> Option<String> {
         fs::read_to_string(f)
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| v.get("_arms_uid").and_then(|u| u.as_str()).map(String::from))
+            .and_then(|v| {
+                v.get("_arms_uid")
+                    .and_then(|u| u.as_str())
+                    .map(String::from)
+            })
             .filter(|u| !u.trim().is_empty())
     };
     let mut files: Vec<PathBuf> = Vec::new();
@@ -1315,7 +2203,11 @@ fn read_live_arms_uid_from(dirs: &[PathBuf]) -> Option<String> {
                 .map(|e| e.path())
                 .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
                 .collect();
-            jsons.sort_by_key(|p| !p.file_name().map(|n| n == ARMS_DEFAULT_STORE_FILE).unwrap_or(false));
+            jsons.sort_by_key(|p| {
+                !p.file_name()
+                    .map(|n| n == ARMS_DEFAULT_STORE_FILE)
+                    .unwrap_or(false)
+            });
             files.extend(jsons);
         }
     }
@@ -1353,7 +2245,9 @@ pub fn write_live_arms_uid_to(dirs: &[PathBuf], uid: &str) -> Result<(), String>
             let obj = v.as_object_mut().unwrap();
             obj.insert("_arms_uid".into(), json!(uid));
             obj.remove("_arms_session");
-            if let Err(e) = atomic_write(&f, &(serde_json::to_string(&v).unwrap_or_default() + "\n")) {
+            if let Err(e) =
+                atomic_write(&f, &(serde_json::to_string(&v).unwrap_or_default() + "\n"))
+            {
                 first_err.get_or_insert(e);
             }
         }
@@ -1369,13 +2263,20 @@ fn write_live_arms_uid(paths: &Paths, uid: &str) -> Result<(), String> {
 }
 
 fn adopt_virtual_arms_uid(paths: &Paths, acc: &mut Account) -> Result<(), String> {
-    if acc.virtual_arms_uid.as_deref().is_some_and(|u| !u.trim().is_empty()) {
+    if acc
+        .virtual_arms_uid
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty())
+    {
         return Ok(());
     }
     let live_uid = read_live_arms_uid_from(&arms_store_dirs_for(paths));
     let taken = |u: &str| {
         list_accounts(paths)
-            .map(|accs| accs.iter().any(|a| a.virtual_arms_uid.as_deref() == Some(u)))
+            .map(|accs| {
+                accs.iter()
+                    .any(|a| a.virtual_arms_uid.as_deref() == Some(u))
+            })
             .unwrap_or(false)
     };
     let uid = match live_uid {
@@ -1411,7 +2312,10 @@ fn import_candidates(v: &Value) -> Result<Vec<ImportCandidate>, String> {
             .ok_or(tr("err.bundle.no_accounts"))?;
         let mut out = vec![];
         for item in arr {
-            let creds = item.get("credentials").cloned().ok_or(tr("err.bundle.no_creds"))?;
+            let creds = item
+                .get("credentials")
+                .cloned()
+                .ok_or(tr("err.bundle.no_creds"))?;
             out.push((
                 item.get("name").and_then(|n| n.as_str()).map(String::from),
                 creds,
@@ -1423,8 +2327,47 @@ fn import_candidates(v: &Value) -> Result<Vec<ImportCandidate>, String> {
     Err(tr("err.bundle.unrecognized"))
 }
 
+pub fn preview_import_values(paths: &Paths, files: &[(String, Value)]) -> Value {
+    let accounts = list_accounts(paths).unwrap_or_default();
+    let mut items = vec![];
+    for (fname, v) in files {
+        let cands = match import_candidates(v) {
+            Ok(c) => c,
+            Err(e) => {
+                items.push(json!({"file": fname, "status": "invalid", "error": e}));
+                continue;
+            }
+        };
+        for (name_opt, creds, _) in cands {
+            if !is_logged_in(&creds) {
+                items.push(
+                    json!({"file": fname, "status": "invalid", "error": tr("err.import.no_creds")}),
+                );
+                continue;
+            }
+            let hash = canonical_hash(&creds);
+            let duplicate = accounts.iter().any(|a| a.hash == hash);
+            let name = name_opt.unwrap_or_else(|| {
+                zcrypto::account_identity(&creds, &paths.home)
+                    .label()
+                    .unwrap_or_else(|| "Account".to_string())
+            });
+            items.push(json!({
+                "file": fname,
+                "name": name,
+                "status": if duplicate { "duplicate" } else { "ready" },
+            }));
+        }
+    }
+    json!({"items": items})
+}
+
 pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportReport, String> {
-    let mut report = ImportReport { picked: true, ..Default::default() };
+    let _ = create_account_backup(paths);
+    let mut report = ImportReport {
+        picked: true,
+        ..Default::default()
+    };
     let accounts = list_accounts(paths)?;
 
     let mut new_accounts: Vec<Account> = vec![];
@@ -1433,23 +2376,33 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
         let cands = match import_candidates(v) {
             Ok(c) => c,
             Err(e) => {
-                report.errors.push(trf("err.import.wrap", &[("fname", fname.as_str()), ("e", e.as_str())]));
+                report.errors.push(trf(
+                    "err.import.wrap",
+                    &[("fname", fname.as_str()), ("e", e.as_str())],
+                ));
                 continue;
             }
         };
         for (name_opt, creds, config_opt) in cands {
             if !is_logged_in(&creds) {
-                report.skipped.push(trf("err.import.no_creds", &[("fname", fname.as_str())]));
+                report
+                    .skipped
+                    .push(trf("err.import.no_creds", &[("fname", fname.as_str())]));
                 continue;
             }
             let hash = canonical_hash(&creds);
-            if accounts.iter().any(|a| a.hash == hash) || new_accounts.iter().any(|a| a.hash == hash) {
-                report.skipped.push(trf("err.import.dup", &[("fname", fname.as_str())]));
+            if accounts.iter().any(|a| a.hash == hash)
+                || new_accounts.iter().any(|a| a.hash == hash)
+            {
+                report
+                    .skipped
+                    .push(trf("err.import.dup", &[("fname", fname.as_str())]));
                 continue;
             }
             let base_name = name_opt.unwrap_or_else(|| {
                 let id = zcrypto::account_identity(&creds, &paths.home);
-                id.label().unwrap_or_else(|| format!("Import {}", Local::now().format("%m-%d %H%M")))
+                id.label()
+                    .unwrap_or_else(|| format!("Import {}", Local::now().format("%m-%d %H%M")))
             });
             let name = unique_name(&accounts, &base_name);
             let ts = now_ts();
@@ -1469,14 +2422,26 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
         }
     }
 
+    let mut written: Vec<Account> = vec![];
     for acc in &new_accounts {
-        save_account(paths, acc)?;
+        if let Err(e) = save_account(paths, acc) {
+            for written_acc in &written {
+                let path = paths
+                    .accounts_dir()
+                    .join(format!("{}.json", written_acc.id));
+                let _ = fs::remove_file(path);
+            }
+            return Err(e);
+        }
+        written.push(acc.clone());
     }
     Ok(report)
 }
 
 pub fn get_state(paths: &Paths) -> Result<AppState, String> {
+    let _ = recover_pending_switch_transactions(paths);
     let accounts = list_accounts(paths)?;
+    let account_issues = list_account_issues(paths);
     let live = read_live(paths)?;
     let live_hash = live.as_ref().map(canonical_hash);
     let live_logged_in = live.as_ref().map(is_logged_in).unwrap_or(false);
@@ -1511,6 +2476,8 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         active_account_id,
         live_identity,
         accounts: summaries,
+        account_issues,
+        backup_count: list_account_backups(paths).len(),
         zcode_path,
         zcode_path_ok,
         store_dir: paths.store_dir().to_string_lossy().to_string(),
@@ -1521,5 +2488,110 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         auth_proxy_on: settings.auth_proxy_on.unwrap_or(false),
         auth_proxy_url: settings.auth_proxy_url.clone(),
         language: crate::i18n::current().as_str().to_string(),
+        gateway_enabled: settings.gateway_enabled(),
+        gateway_port: settings.gateway_port(),
+        gateway_key_set: settings
+            .gateway_key
+            .as_deref()
+            .is_some_and(|k| !k.trim().is_empty()),
+        captcha_solver_python: settings.captcha_solver_python.clone(),
+        captcha_solver_script: settings.captcha_solver_script.clone(),
     })
+}
+
+#[cfg(test)]
+mod store_safety_tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn rejects_empty_oauth_access_tokens() {
+        let v = json!({"oauth:zai:access_token": ""});
+        assert!(!is_logged_in(&v));
+    }
+
+    #[test]
+    fn accepts_nonempty_oauth_access_tokens() {
+        let v = json!({"oauth:zai:access_token": " token "});
+        assert!(is_logged_in(&v));
+    }
+
+    #[test]
+    fn accepts_nonempty_jwt() {
+        let v = json!({"zcodejwttoken": "jwt"});
+        assert!(is_logged_in(&v));
+    }
+
+    #[test]
+    fn creates_and_lists_account_backups() {
+        let root = env::temp_dir().join(format!("zsw-test-{}", Uuid::new_v4()));
+        let paths = Paths {
+            home: root.clone(),
+            data_root: root.clone(),
+        };
+        paths.ensure_dirs().unwrap();
+        let backup = create_account_backup(&paths).unwrap();
+        assert_eq!(list_account_backups(&paths).len(), 1);
+        assert_eq!(backup.account_count, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovers_started_switch_transaction() {
+        let root = env::temp_dir().join(format!("zsw-tx-test-{}", Uuid::new_v4()));
+        let paths = Paths {
+            home: root.clone(),
+            data_root: root.clone(),
+        };
+        paths.ensure_dirs().unwrap();
+        fs::create_dir_all(paths.live_file().parent().unwrap()).unwrap();
+        fs::write(paths.live_file(), r#"{"zcodejwttoken":"before"}"#).unwrap();
+        let tx = begin_switch_transaction(&paths, "target").unwrap();
+        fs::write(paths.live_file(), r#"{"zcodejwttoken":"after"}"#).unwrap();
+        let recovered = recover_pending_switch_transactions(&paths);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(tx.status, "started");
+        let raw = fs::read_to_string(paths.live_file()).unwrap();
+        assert!(raw.contains("before"));
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_proc_tests {
+    use super::*;
+
+    #[test]
+    fn reads_own_proc_entry() {
+        let p = read_proc(std::process::id() as i32).expect("read self");
+        assert!(!p.comm.is_empty());
+        assert!(!p.argv.is_empty());
+    }
+
+    #[test]
+    fn launch_env_only_returns_whitelisted_keys() {
+        for (k, _) in proc_launch_env(std::process::id() as i32) {
+            assert!(LAUNCH_ENV_KEYS.contains(&k.as_str()), "unexpected key {k}");
+        }
+    }
+
+    #[test]
+    fn captures_wrapper_launch_spec_when_zcode_running() {
+        let procs = zcode_procs();
+        if procs.is_empty() {
+            return;
+        }
+        capture_launch_spec(&procs);
+        let spec = REMEMBERED_LAUNCH
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("spec captured");
+        assert!(
+            spec.program.exists(),
+            "program missing: {}",
+            spec.program.display()
+        );
+        assert!(!spec.args.is_empty(), "wrapper launch should carry args");
+    }
 }
