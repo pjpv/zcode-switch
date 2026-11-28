@@ -28,6 +28,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify release version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          NPM_VER=$(node -p "require('./package.json').version")
+          TAURI_VER=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          test "$TAG" = "$NPM_VER"
+          test "$TAG" = "$TAURI_VER"
+
+      - name: Build frontend and validate i18n
+        run: |
+          npm ci
+          npm run build
+          npm run check:i18n
+
+      - name: Generate dependency manifest
+        run: cargo metadata --manifest-path src-tauri/Cargo.toml --format-version 1 > dependencies.json
+
       - name: Install Linux system deps
         if: runner.os == 'Linux'
         run: |
@@ -75,6 +93,14 @@ jobs:
           releaseDraft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           args: --bundles ${{ matrix.bundles }} ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) || '' }}
+
+      - name: Upload dependency manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp dependencies.json "dependencies-${RUNNER_OS}-${GITHUB_REF_NAME}.json"
+          gh release upload "$GITHUB_REF_NAME" "dependencies-${RUNNER_OS}-${GITHUB_REF_NAME}.json" --clobber
 
       - name: Upload portable exe + checksums (windows)
         if: runner.os == 'Windows'

@@ -15,6 +15,8 @@ Tauri 2 桌面工具：在多个 ZCode 账号之间一键切换，自动显示�
 - **加密导入导出**：`.zsb` 捆绑包，PBKDF2(100k) + AES-256-GCM 口令加密
 - **中英双语**：设置里一键切换 中文 / English，主窗、托盘、错误提示、CLI 输出全覆盖；首次运行按系统语言自动选择
 - **托盘 / 开机自启 / CLI 自动化**
+- **数据恢复**：账号库自动备份、手动备份、备份保留与恢复
+- **异常健康中心**：损坏账号文件、备份状态、登录状态和 ZCode 运行状态提示
 
 ## 安全设计
 
@@ -38,6 +40,10 @@ zcode-switch.exe --cli export --id <id> --out <a.zsb>
 zcode-switch.exe --cli export-all --out <all.zsb>
 zcode-switch.exe --cli import --file <file.zsb>
 zcode-switch.exe --cli rename|delete|update|behavior|setpath|launch
+zcode-switch.exe --cli backup
+zcode-switch.exe --cli backups
+zcode-switch.exe --cli restore --name <backup-name>
+zcode-switch.exe --cli health
 zcode-switch.exe --cli --lang en state              # 英文输出（--lang 空格传值、可置于任意位置；默认跟 GUI 语言/系统语言）
 ```
 

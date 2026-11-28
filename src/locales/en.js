@@ -98,6 +98,11 @@ export const en = {
   "m.saveLoginDisabledTitle": "Current login is already saved as \"{name}\"",
   "m.accounts": "ACCOUNTS · Library",
   "m.count": "{count} saved",
+  "m.accountDataWarning": "Account-library data issues detected. These files were not deleted or overwritten:",
+  "m.backup": "Backup",
+  "m.backupTitle": "Create an account-library backup now",
+  "m.backupCreated": "Backup created with {count} accounts",
+  "m.noBackups": "No account-library backup exists yet; create one now.",
 
   "btn.saveLogin": "Save login",
   "btn.claimAll": "Claim all",

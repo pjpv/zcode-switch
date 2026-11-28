@@ -25,6 +25,7 @@ chrono = "0.4"
 aes-gcm = "0.10"
 base64 = "0.22"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+fs2 = "0.4"
 ureq = { version = "2", features = ["json"] }
 sys-locale = "0.3"
 # 本地聚合网关：axum 承接入站（/v1/messages 等），tokio 承载 async；

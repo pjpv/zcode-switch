@@ -1,4 +1,3 @@
-
 use crate::store::*;
 use serde_json::{json, Value};
 use std::fs;
@@ -55,6 +54,10 @@ pub fn run(args: &[String]) -> (String, i32) {
         out
     };
     let paths = Paths::detect();
+    let _store_lock = match StoreLock::acquire(&paths) {
+        Ok(lock) => lock,
+        Err(e) => return (err(&e), 1),
+    };
 
     if let Some(l) = lang_override {
         crate::i18n::set(l);
@@ -79,7 +82,8 @@ pub fn run(args: &[String]) -> (String, i32) {
                     "accounts": a.iter().map(|x| json!({
                         "id": x.id, "name": x.name, "created_at": x.created_at,
                         "updated_at": x.updated_at, "hash": x.hash,
-                    })).collect::<Vec<_>>()
+                    })).collect::<Vec<_>>(),
+                    "account_issues": list_account_issues(&paths),
                 })),
                 Err(e) => return (err(&e), 1),
             }
@@ -174,9 +178,17 @@ pub fn run(args: &[String]) -> (String, i32) {
             };
             let mut any = false;
             let mut items = vec![];
-            for acc in accounts.iter().filter(|a| only.as_deref().map_or(true, |id| id == a.id)) {
+            for acc in accounts
+                .iter()
+                .filter(|a| only.as_deref().map_or(true, |id| id == a.id))
+            {
                 let res = ensure_virtual_device_mid(&paths, &acc.id).and_then(|mid| {
-                    crate::claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))
+                    crate::claim::preview_plans(
+                        &paths.home,
+                        &acc.credentials,
+                        acc.config.as_ref(),
+                        Some(mid),
+                    )
                 });
                 match res {
                     Ok(plans) => {
@@ -198,6 +210,34 @@ pub fn run(args: &[String]) -> (String, i32) {
             }
             ok(json!({ "anyClaimable": any, "accounts": items }))
         }
+        "backup" => match create_account_backup(&paths) {
+            Ok(info) => {
+                append_operation_audit(&paths, "cli-backup", &json!({"name": info.name}));
+                ok(serde_json::to_value(info).unwrap_or(Value::Null))
+            }
+            Err(e) => return (err(&e), 1),
+        },
+        "backups" => ok(json!({"backups": list_account_backups(&paths)})),
+        "restore" => {
+            let Some(name) = flag(rest, "--name") else {
+                return (err(&crate::i18n::tr("cli.usage.delete")), 2);
+            };
+            match restore_account_backup(&paths, &name) {
+                Ok(restored) => ok(json!({"restored": restored, "name": name})),
+                Err(e) => return (err(&e), 1),
+            }
+        }
+        "health" => match get_state(&paths) {
+            Ok(state) => ok(json!({
+                "accounts": state.accounts.len(),
+                "account_issues": state.account_issues,
+                "backup_count": state.backup_count,
+                "live_logged_in": state.live_logged_in,
+                "zcode_running": state.zcode_running,
+                "zcode_path_ok": state.zcode_path_ok,
+            })),
+            Err(e) => return (err(&e), 1),
+        },
         "behavior" => {
             let las = flag(rest, "--launch-after-switch");
             let ctt = flag(rest, "--close-to-tray");
@@ -228,11 +268,27 @@ pub fn run(args: &[String]) -> (String, i32) {
                     let payload = export_bundle_value(std::slice::from_ref(&a));
                     match crate::cipher::seal(&payload, &password, crate::cipher::FORMAT_BUNDLE) {
                         Ok(sealed) => match serde_json::to_string_pretty(&sealed) {
-                            Ok(body) => match atomic_write(std::path::Path::new(&out_path), &(body + "\n")) {
-                                Ok(()) => ok(json!({ "out": out_path, "encrypted": true })),
-                                Err(e) => return (err(&crate::i18n::trf("err.write", &[("e", &e)])), 1),
-                            },
-                            Err(e) => return (err(&crate::i18n::trf("err.serialize", &[("e", &e.to_string())])), 1),
+                            Ok(body) => {
+                                match atomic_write(std::path::Path::new(&out_path), &(body + "\n"))
+                                {
+                                    Ok(()) => ok(json!({ "out": out_path, "encrypted": true })),
+                                    Err(e) => {
+                                        return (
+                                            err(&crate::i18n::trf("err.write", &[("e", &e)])),
+                                            1,
+                                        )
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                return (
+                                    err(&crate::i18n::trf(
+                                        "err.serialize",
+                                        &[("e", &e.to_string())],
+                                    )),
+                                    1,
+                                )
+                            }
                         },
                         Err(e) => return (err(&e), 1),
                     }
@@ -248,13 +304,20 @@ pub fn run(args: &[String]) -> (String, i32) {
                 return (err(&crate::i18n::tr("cli.pw_hint")), 2);
             };
             match list_accounts(&paths).map(|a| export_bundle_value(&a)) {
-                Ok(payload) => match crate::cipher::seal(&payload, &password, crate::cipher::FORMAT_BUNDLE) {
-                    Ok(sealed) => match atomic_write(std::path::Path::new(&out_path), &(serde_json::to_string_pretty(&sealed).unwrap() + "\n")) {
-                        Ok(()) => ok(json!({ "out": out_path, "encrypted": true })),
-                        Err(e) => return (err(&crate::i18n::trf("err.write", &[("e", &e)])), 1),
-                    },
-                    Err(e) => return (err(&e), 1),
-                },
+                Ok(payload) => {
+                    match crate::cipher::seal(&payload, &password, crate::cipher::FORMAT_BUNDLE) {
+                        Ok(sealed) => match atomic_write(
+                            std::path::Path::new(&out_path),
+                            &(serde_json::to_string_pretty(&sealed).unwrap() + "\n"),
+                        ) {
+                            Ok(()) => ok(json!({ "out": out_path, "encrypted": true })),
+                            Err(e) => {
+                                return (err(&crate::i18n::trf("err.write", &[("e", &e)])), 1)
+                            }
+                        },
+                        Err(e) => return (err(&e), 1),
+                    }
+                }
                 Err(e) => return (err(&e), 1),
             }
         }
@@ -264,11 +327,21 @@ pub fn run(args: &[String]) -> (String, i32) {
             };
             let raw = match fs::read_to_string(&file) {
                 Ok(r) => r,
-                Err(e) => return (err(&crate::i18n::trf("cli.read_fail", &[("e", &e.to_string())])), 1),
+                Err(e) => {
+                    return (
+                        err(&crate::i18n::trf("cli.read_fail", &[("e", &e.to_string())])),
+                        1,
+                    )
+                }
             };
             let v: Value = match serde_json::from_str(&raw) {
                 Ok(v) => v,
-                Err(e) => return (err(&crate::i18n::trf("cli.json_fail", &[("e", &e.to_string())])), 1),
+                Err(e) => {
+                    return (
+                        err(&crate::i18n::trf("cli.json_fail", &[("e", &e.to_string())])),
+                        1,
+                    )
+                }
             };
             if !crate::cipher::is_sealed(&v) {
                 return (err(&crate::i18n::tr("err.import.not_sealed_plain")), 2);
@@ -302,7 +375,10 @@ pub fn run(args: &[String]) -> (String, i32) {
         "launch" => {
             let (p, ok_path) = effective_zcode_path(&paths);
             if !ok_path {
-                return (err(&crate::i18n::trf("err.zcode.path_invalid", &[("p", &p)])), 1);
+                return (
+                    err(&crate::i18n::trf("err.zcode.path_invalid", &[("p", &p)])),
+                    1,
+                );
             }
             match launch_zcode(&paths, &p) {
                 Ok(()) => ok(json!({ "launched": p })),
@@ -312,7 +388,14 @@ pub fn run(args: &[String]) -> (String, i32) {
         // gateway              → 状态/池视图（只读）
         // gateway --on|--off --port N --key K --solver-python P --solver-script S → 修改设置
         "gateway" => {
-            if rest.iter().any(|a| a == "--on" || a == "--off" || flag(rest, "--port").is_some() || flag(rest, "--key").is_some() || flag(rest, "--solver-python").is_some() || flag(rest, "--solver-script").is_some()) {
+            if rest.iter().any(|a| {
+                a == "--on"
+                    || a == "--off"
+                    || flag(rest, "--port").is_some()
+                    || flag(rest, "--key").is_some()
+                    || flag(rest, "--solver-python").is_some()
+                    || flag(rest, "--solver-script").is_some()
+            }) {
                 let mut s = load_settings(&paths);
                 if rest.contains(&"--on".to_string()) {
                     s.gateway_enabled = Some(true);
@@ -340,7 +423,12 @@ pub fn run(args: &[String]) -> (String, i32) {
             }
             return (ok(crate::gateway::status_view(&paths)), 0);
         }
-        other => return (err(&crate::i18n::trf("cli.unknown_cmd", &[("cmd", other)])), 2),
+        other => {
+            return (
+                err(&crate::i18n::trf("cli.unknown_cmd", &[("cmd", other)])),
+                2,
+            )
+        }
     };
     (out, 0)
 }

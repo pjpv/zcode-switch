@@ -98,6 +98,11 @@ export const zh = {
   "m.saveLoginDisabledTitle": "当前登录已是存档「{name}」，无需重复保存",
   "m.accounts": "ACCOUNTS · 账号库",
   "m.count": "{count} 个存档",
+  "m.accountDataWarning": "检测到账号库数据异常，以下文件未被自动删除或覆盖：",
+  "m.backup": "备份",
+  "m.backupTitle": "立即创建账号库备份",
+  "m.backupCreated": "已创建备份，共 {count} 个账号",
+  "m.noBackups": "尚未创建账号库备份，建议立即备份。",
 
   "btn.saveLogin": "保存登录",
   "btn.claimAll": "全部领取",

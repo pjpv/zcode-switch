@@ -18,15 +18,40 @@ jobs:
         with:
           workspaces: src-tauri
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Frontend and i18n checks
+        run: |
+          npm run build
+          npm run check:i18n
+
       - name: cargo test
         run: cargo test --lib
         working-directory: src-tauri
+
+      - name: cargo fmt
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Dependency manifests
+        run: |
+          npm audit --omit=dev --audit-level=high
+          cargo install cargo-audit --locked
+          cargo audit --manifest-path src-tauri/Cargo.toml
 
   check-portability:
     name: cargo test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -55,15 +80,8 @@ jobs:
 
       - name: Publish log on failure
         if: failure()
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config user.name ci-logbot
-          git config user.email bot@users.noreply.github.com
-          git checkout --orphan ci-logs
-          git rm -rf -q .
-          cp src-tauri/check.log "check-${RUNNER_OS}.log"
-          git add "check-${RUNNER_OS}.log"
-          git commit -qm "ci log ${GITHUB_SHA}"
-          git push -q origin HEAD:ci-logs --force
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-log-${{ runner.os }}
+          path: src-tauri/check.log
+          retention-days: 7

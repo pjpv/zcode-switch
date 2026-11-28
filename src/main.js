@@ -142,6 +142,14 @@ function autoPillTitle(s) {
 const actions = {
   async refresh() { await refresh(); render(); },
 
+  async backup() {
+    await guard(async () => {
+      const r = await invoke("create_account_backup");
+      toast(t("m.backupCreated", { count: r.account_count }), "ok");
+      await refresh(); render();
+    });
+  },
+
   async capture() {
     await guard(async () => {
       const r = await invoke("capture_current", { name: null });
@@ -871,6 +879,9 @@ function render() {
     : rows;
 
   const claimableCount = s.accounts.filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
+  const accountIssues = (s.account_issues || []).map((issue) =>
+    `<li>${esc(issue.file)} — ${esc(issue.error)}</li>`
+  ).join("");
 
   $app.innerHTML = `
     <header class="topbar">
@@ -901,6 +912,7 @@ function render() {
               : esc(t("btn.refreshClaim"))}
           </button>`
         : ""}
+      <button class="btn-ghost has-ic" click="actions.backup()" title="${t("m.backupTitle")}">${ic("refresh", 16)} ${t("m.backup")}</button>
       ${gatewayPill(s)}
       <button class="tog-inline${s.auto_claim ? " on" : ""}${autoClaimRunning ? " running" : ""}"
         role="switch" aria-checked="${s.auto_claim}" aria-label="${t("btn.autoClaim")}"
@@ -916,6 +928,13 @@ function render() {
       <span class="tb-spacer"></span>
       <button class="btn-ghost tb-gear has-ic" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 16)}</button>
     </section>
+
+    ${accountIssues ? `
+      <div class="account-data-warning" role="alert">
+        <strong>${esc(t("m.accountDataWarning"))}</strong>
+        <ul>${accountIssues}</ul>
+      </div>` : ""}
+    ${s.backup_count === 0 ? `<div class="account-data-warning" role="status">${esc(t("m.noBackups"))}</div>` : ""}
 
     <div class="section-head">
       <h2>${t("m.accounts")}</h2>
